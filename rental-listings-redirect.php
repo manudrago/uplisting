@@ -40,6 +40,7 @@ class Rental_Listings_Redirect {
         // === CRON SYNC EVERY 3 HOURS ===
         add_filter('cron_schedules', [$this, 'cron_three_hour']);
         add_action('uplisting_cron_sync', [$this, 'uplisting_run_cron']);
+        add_action('admin_init', [$this, 'fix_cron_interval']);
         register_activation_hook(__FILE__, [$this, 'activate_cron']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate_cron']);
 
@@ -340,39 +341,95 @@ class Rental_Listings_Redirect {
                 <textarea name="uplisting_api_keys" rows="5" cols="60"><?php echo esc_textarea(implode("\n",$keys)); ?></textarea>
                 <p><input type="submit" name="uplisting_save_keys" class="button button-primary" value="Save Keys"></p>
             </form>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+            <?php
+            $cursor = get_option('rl_sync_cursor', false);
+            if (isset($_GET['synced'])) {
+                echo empty($_GET['done'])
+                    ? '<div class="notice notice-warning"><p>Sync in progress — press <strong>Continue sync</strong> again, or leave it to the background job.</p></div>'
+                    : '<div class="notice notice-success"><p>✅ Sync complete.</p></div>';
+            }
+            if ($cursor !== false) {
+                printf(
+                    '<div class="notice notice-info"><p>A pass is part-way through (account %d, property %d). <strong>Continue sync</strong> resumes it; <em>Restart</em> throws it away and begins again.</p></div>',
+                    (int) (isset($cursor['k']) ? $cursor['k'] : 0) + 1,
+                    (int) (isset($cursor['o']) ? $cursor['o'] : 0)
+                );
+            }
+            ?>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:inline-block">
                 <input type="hidden" name="action" value="uplisting_sync_now">
-                <?php submit_button('Sync Now from Uplisting','secondary'); ?>
+                <?php submit_button($cursor !== false ? 'Continue sync' : 'Sync Now from Uplisting', 'primary', 'submit', false); ?>
             </form>
-            <p><em>Last sync: <?php echo esc_html(get_option('uplisting_last_sync_time') ? date('Y-m-d H:i:s', get_option('uplisting_last_sync_time')) : 'Never'); ?></em></p>
-            <p>🔄 Automatic sync runs every 3 hours.</p>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:inline-block;margin-left:8px">
+                <input type="hidden" name="action" value="uplisting_sync_now">
+                <input type="hidden" name="restart" value="1">
+                <?php submit_button('Restart from scratch', 'secondary', 'submit', false); ?>
+            </form>
+            <p><em>Last completed sync: <?php echo esc_html(get_option('uplisting_last_sync_time') ? date('Y-m-d H:i:s', get_option('uplisting_last_sync_time')) : 'Never'); ?></em></p>
+            <p>🔄 Automatic sync runs every 3 hours. Each press works for about 40 seconds and then hands off to the background job, so a large account may need a few presses.</p>
+            <p><a href="<?php echo esc_url(admin_url('?rl_audit=1')); ?>">Open the audit</a> to compare what the API returns with what the site shows.</p>
         </div>
         <?php
     }
 
     public function uplisting_manual_sync() {
-        $this->uplisting_sync_run();
-        wp_redirect(admin_url('edit.php?post_type=rental_property&page=uplisting-settings&synced=1'));
+        // Resume by default. Restarting silently is what makes the button dangerous mid-pass:
+        // it threw away the progress of a run already under way.
+        $restart = !empty($_REQUEST['restart']);
+        $res = $this->uplisting_sync_run($restart);
+
+        wp_redirect(add_query_arg(array(
+            'post_type' => 'rental_property',
+            'page'      => 'uplisting-settings',
+            'synced'    => 1,
+            'done'      => !empty($res['all_done']) ? 1 : 0,
+        ), admin_url('edit.php')));
         exit;
     }
 
-    public function uplisting_sync_run() {
+    /**
+     * @param bool $restart True to begin a fresh pass, false to continue an unfinished one.
+     * @return array Last tick result.
+     */
+    public function uplisting_sync_run($restart = false) {
         @set_time_limit(0);
         @ini_set('memory_limit', '256M');
-        // Queued, rate-limit-friendly sync: reset cursor and process a small first batch, then continue in the background.
-        update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
-        if (function_exists('rl_sync_tick')) { rl_sync_tick(2); }
-        if (get_option('rl_sync_cursor', false) !== false && !wp_next_scheduled('rl_sync_continue')) {
-            wp_schedule_single_event(time() + 60, 'rl_sync_continue');
+
+        if (!function_exists('rl_sync_tick')) return array('error' => 'sync not loaded');
+
+        if ($restart || get_option('rl_sync_cursor', false) === false) {
+            update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
+            // A restarted pass must not inherit the previous pass's seen ids, or reconciliation
+            // spares properties the API no longer returns.
+            delete_option('rl_sync_seen_ids');
+            foreach ((array) get_option('uplisting_api_keys', array()) as $k) {
+                delete_transient('rl_props_' . md5(trim($k)));
+                delete_transient('rl_live_ids_' . md5(trim($k)));
+            }
         }
-        update_option('uplisting_last_sync_time', time());
+
+        // Work for a bounded stretch rather than two properties, then hand off to cron.
+        $started = time();
+        $res = array();
+        do {
+            $res = rl_sync_tick(5);
+            if (!empty($res['error'])) break;
+        } while (empty($res['all_done']) && (time() - $started) < 40);
+
+        if (empty($res['all_done'])) rl_schedule_continue();
+
+        // uplisting_last_sync_time is stamped by rl_sync_tick when the pass actually completes;
+        // stamping it here made a half-finished pass look like a finished one.
+        return $res;
     }
 
     /* ----------------------------------------
      * CRON
      * -------------------------------------- */
     public function cron_three_hour($schedules){
-        $schedules['every_three_hours'] = ['interval'=>864000,'display'=>'Every 10 Days'];
+        // Was 864000 seconds — ten days — despite the name, the comment and the settings screen
+        // all promising three hours.
+        $schedules['every_three_hours'] = ['interval' => 3 * HOUR_IN_SECONDS, 'display' => 'Every 3 hours'];
         return $schedules;
     }
 
@@ -380,6 +437,19 @@ class Rental_Listings_Redirect {
         if(!wp_next_scheduled('uplisting_cron_sync')){
             wp_schedule_event(time(),'every_three_hours','uplisting_cron_sync');
         }
+    }
+
+    /**
+     * Existing installs hold a scheduled event built on the ten-day interval; changing the
+     * schedule definition does not move it. Re-register it once.
+     *
+     * @return void
+     */
+    public function fix_cron_interval(){
+        if (get_option('rl_cron_interval_fixed')) return;
+        wp_clear_scheduled_hook('uplisting_cron_sync');
+        wp_schedule_event(time() + 300, 'every_three_hours', 'uplisting_cron_sync');
+        update_option('rl_cron_interval_fixed', 1, false);
     }
 
     public function deactivate_cron(){ wp_clear_scheduled_hook('uplisting_cron_sync'); }
