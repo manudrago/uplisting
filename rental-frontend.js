@@ -280,6 +280,7 @@ jQuery(function ($) {
         }).addTo(map);
 
         const props = propsOverride || window.rentalAllProperties || [];
+        console.log('rental map: drawing ' + props.length + ' points');
         const markers = [];
         const markersById = {};
         let fallbackNumber = Object.keys(numberById).length + 1;
