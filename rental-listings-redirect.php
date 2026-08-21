@@ -40,6 +40,7 @@ class Rental_Listings_Redirect {
         // === CRON SYNC EVERY 3 HOURS ===
         add_filter('cron_schedules', [$this, 'cron_three_hour']);
         add_action('uplisting_cron_sync', [$this, 'uplisting_run_cron']);
+        add_action('admin_init', [$this, 'fix_cron_interval']);
         register_activation_hook(__FILE__, [$this, 'activate_cron']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate_cron']);
 
@@ -300,7 +301,10 @@ class Rental_Listings_Redirect {
             ];
         }
 
-        // Query and print same template (design unchanged)
+        // Query and print same template (design unchanged). The map is built from this same set of
+        // clauses — passed explicitly rather than read back off the WP_Query, which did not survive
+        // the round trip and left the map showing every property.
+        $rl_map_meta = $args['meta_query'];
         $query = new WP_Query($args);
         ob_start();
         include plugin_dir_path(__FILE__) . 'rental-listings-template.php';
@@ -340,39 +344,197 @@ class Rental_Listings_Redirect {
                 <textarea name="uplisting_api_keys" rows="5" cols="60"><?php echo esc_textarea(implode("\n",$keys)); ?></textarea>
                 <p><input type="submit" name="uplisting_save_keys" class="button button-primary" value="Save Keys"></p>
             </form>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                <input type="hidden" name="action" value="uplisting_sync_now">
-                <?php submit_button('Sync Now from Uplisting','secondary'); ?>
-            </form>
-            <p><em>Last sync: <?php echo esc_html(get_option('uplisting_last_sync_time') ? date('Y-m-d H:i:s', get_option('uplisting_last_sync_time')) : 'Never'); ?></em></p>
-            <p>🔄 Automatic sync runs every 3 hours.</p>
+            <?php
+            $cursor = get_option('rl_sync_cursor', false);
+            $last   = get_option('uplisting_last_sync_time');
+            ?>
+
+            <h2>Sync</h2>
+            <p>
+                <button type="button" class="button button-primary" id="rl-sync-start">Sync now</button>
+                <label style="margin-left:12px"><input type="checkbox" id="rl-sync-restart" <?php checked($cursor === false); ?>> start from scratch</label>
+            </p>
+            <?php if ($cursor !== false) : ?>
+                <p class="description">A pass is part-way through (account <?php echo (int) (isset($cursor['k']) ? $cursor['k'] : 0) + 1; ?>, property <?php echo (int) (isset($cursor['o']) ? $cursor['o'] : 0); ?>). Leave the box unticked to carry on from there.</p>
+            <?php endif; ?>
+
+            <div id="rl-sync-box" style="display:none;max-width:640px">
+                <div style="background:#e5e5e5;border-radius:3px;height:22px;overflow:hidden">
+                    <div id="rl-sync-bar" style="background:#2271b1;height:100%;width:0;transition:width .3s"></div>
+                </div>
+                <p id="rl-sync-msg" style="margin:8px 0 0"></p>
+                <pre id="rl-sync-report" style="display:none;white-space:pre-wrap;background:#fff;border:1px solid #ccd0d4;padding:10px;margin-top:10px"></pre>
+            </div>
+
+            <p><em>Last completed sync: <?php echo esc_html($last ? date('Y-m-d H:i:s', $last) : 'Never'); ?></em></p>
+            <p>🔄 Automatic sync runs every 3 hours. Pressing the button drives the whole pass from this page — keep the tab open until it says it has finished. If you close it, the background job picks up where it stopped.</p>
+            <p><a href="<?php echo esc_url(admin_url('?rl_audit=1')); ?>">Open the audit</a> to compare what the API returns with what the site shows.</p>
+
+            <script>
+            (function () {
+                var startBtn = document.getElementById('rl-sync-start'),
+                    restart  = document.getElementById('rl-sync-restart'),
+                    box      = document.getElementById('rl-sync-box'),
+                    bar      = document.getElementById('rl-sync-bar'),
+                    msg      = document.getElementById('rl-sync-msg'),
+                    report   = document.getElementById('rl-sync-report'),
+                    nonce    = <?php echo wp_json_encode(wp_create_nonce('rl_sync_step')); ?>,
+                    ajaxurl  = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>,
+                    first    = true,
+                    stopped  = false;
+
+                function step() {
+                    if (stopped) return;
+
+                    var body = new URLSearchParams();
+                    body.append('action', 'rl_sync_step');
+                    body.append('nonce', nonce);
+                    if (first && restart.checked) body.append('restart', '1');
+                    first = false;
+
+                    fetch(ajaxurl, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString()
+                    })
+                    .then(function (r) { return r.json(); })
+                    .then(function (json) {
+                        if (!json || !json.success) {
+                            fail((json && json.data && json.data.message) || 'The server refused the request.');
+                            return;
+                        }
+
+                        var d = json.data;
+
+                        if (d.error) { fail(d.error); return; }
+
+                        var total = d.properties_for_key || 0,
+                            done  = d.offset || 0,
+                            pct   = total ? Math.round((done / total) * 100) : 0;
+
+                        bar.style.width = (d.all_done ? 100 : pct) + '%';
+                        msg.textContent = d.all_done
+                            ? 'Finished.'
+                            : 'Account ' + ((d.key_index || 0) + 1) + ' of ' + (d.key_count || 1) +
+                              ' — ' + done + ' of ' + total + ' properties';
+
+                        if (d.all_done) {
+                            startBtn.disabled = false;
+                            startBtn.textContent = 'Sync now';
+                            bar.style.background = '#00a32a';
+                            showReport(d);
+                            return;
+                        }
+
+                        step();
+                    })
+                    .catch(function (e) { fail(e.message || 'Network error.'); });
+                }
+
+                function showReport(d) {
+                    var lines = ['Sync complete.'];
+                    var r = d.reconciled;
+                    if (r && r.drafted && r.drafted.length) {
+                        lines.push('', 'Set to draft (no longer in the Uplisting API):');
+                        r.drafted.forEach(function (p) {
+                            lines.push('  #' + p.post_id + '  [' + p.uplisting_id + ']  ' + p.title);
+                        });
+                    } else if (r && r.skipped) {
+                        lines.push('', 'Reconciliation skipped: ' + r.skipped);
+                    } else {
+                        lines.push('', 'Nothing needed drafting.');
+                    }
+                    report.textContent = lines.join('\n');
+                    report.style.display = 'block';
+                }
+
+                function fail(text) {
+                    stopped = true;
+                    startBtn.disabled = false;
+                    startBtn.textContent = 'Resume sync';
+                    bar.style.background = '#d63638';
+                    msg.textContent = 'Stopped: ' + text + ' Press Resume to carry on — nothing is lost.';
+                }
+
+                startBtn.addEventListener('click', function () {
+                    stopped = false;
+                    startBtn.disabled = true;
+                    startBtn.textContent = 'Syncing…';
+                    box.style.display = 'block';
+                    report.style.display = 'none';
+                    bar.style.background = '#2271b1';
+                    msg.textContent = 'Starting…';
+                    step();
+                });
+
+                window.addEventListener('beforeunload', function (e) {
+                    if (startBtn.disabled) { e.preventDefault(); e.returnValue = ''; }
+                });
+            })();
+            </script>
         </div>
         <?php
     }
 
     public function uplisting_manual_sync() {
-        $this->uplisting_sync_run();
-        wp_redirect(admin_url('edit.php?post_type=rental_property&page=uplisting-settings&synced=1'));
+        // Resume by default. Restarting silently is what makes the button dangerous mid-pass:
+        // it threw away the progress of a run already under way.
+        $restart = !empty($_REQUEST['restart']);
+        $res = $this->uplisting_sync_run($restart);
+
+        wp_redirect(add_query_arg(array(
+            'post_type' => 'rental_property',
+            'page'      => 'uplisting-settings',
+            'synced'    => 1,
+            'done'      => !empty($res['all_done']) ? 1 : 0,
+        ), admin_url('edit.php')));
         exit;
     }
 
-    public function uplisting_sync_run() {
+    /**
+     * @param bool $restart True to begin a fresh pass, false to continue an unfinished one.
+     * @return array Last tick result.
+     */
+    public function uplisting_sync_run($restart = false) {
         @set_time_limit(0);
         @ini_set('memory_limit', '256M');
-        // Queued, rate-limit-friendly sync: reset cursor and process a small first batch, then continue in the background.
-        update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
-        if (function_exists('rl_sync_tick')) { rl_sync_tick(2); }
-        if (get_option('rl_sync_cursor', false) !== false && !wp_next_scheduled('rl_sync_continue')) {
-            wp_schedule_single_event(time() + 60, 'rl_sync_continue');
+
+        if (!function_exists('rl_sync_tick')) return array('error' => 'sync not loaded');
+
+        if ($restart || get_option('rl_sync_cursor', false) === false) {
+            update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
+            // A restarted pass must not inherit the previous pass's seen ids, or reconciliation
+            // spares properties the API no longer returns.
+            delete_option('rl_sync_seen_ids');
+            foreach ((array) get_option('uplisting_api_keys', array()) as $k) {
+                delete_transient('rl_props_' . md5(trim($k)));
+                delete_transient('rl_live_ids_' . md5(trim($k)));
+            }
         }
-        update_option('uplisting_last_sync_time', time());
+
+        // Work for a bounded stretch rather than two properties, then hand off to cron.
+        $started = time();
+        $res = array();
+        do {
+            $res = rl_sync_tick(5);
+            if (!empty($res['error'])) break;
+        } while (empty($res['all_done']) && (time() - $started) < 40);
+
+        if (empty($res['all_done'])) rl_schedule_continue();
+
+        // uplisting_last_sync_time is stamped by rl_sync_tick when the pass actually completes;
+        // stamping it here made a half-finished pass look like a finished one.
+        return $res;
     }
 
     /* ----------------------------------------
      * CRON
      * -------------------------------------- */
     public function cron_three_hour($schedules){
-        $schedules['every_three_hours'] = ['interval'=>864000,'display'=>'Every 10 Days'];
+        // Was 864000 seconds — ten days — despite the name, the comment and the settings screen
+        // all promising three hours.
+        $schedules['every_three_hours'] = ['interval' => 3 * HOUR_IN_SECONDS, 'display' => 'Every 3 hours'];
         return $schedules;
     }
 
@@ -380,6 +542,19 @@ class Rental_Listings_Redirect {
         if(!wp_next_scheduled('uplisting_cron_sync')){
             wp_schedule_event(time(),'every_three_hours','uplisting_cron_sync');
         }
+    }
+
+    /**
+     * Existing installs hold a scheduled event built on the ten-day interval; changing the
+     * schedule definition does not move it. Re-register it once.
+     *
+     * @return void
+     */
+    public function fix_cron_interval(){
+        if (get_option('rl_cron_interval_fixed')) return;
+        wp_clear_scheduled_hook('uplisting_cron_sync');
+        wp_schedule_event(time() + 300, 'every_three_hours', 'uplisting_cron_sync');
+        update_option('rl_cron_interval_fixed', 1, false);
     }
 
     public function deactivate_cron(){ wp_clear_scheduled_hook('uplisting_cron_sync'); }
@@ -773,15 +948,253 @@ function rl_sync_tick($batch = 2, $dry = false) {
     $sync = new Uplisting_Sync($client, $key);
     $res = $sync->sync_batch($o, $batch, $dry);
     if ($dry) { return array('dry' => true, 'key_index' => $k, 'key_count' => count($keys), 'properties_for_key' => isset($res['total']) ? $res['total'] : null); }
+
+    // Remember every id the API returned during this pass, across all keys, so that when the pass
+    // finishes we can draft anything that has silently disappeared from the account.
+    if (!empty($res['ids']) && is_array($res['ids'])) {
+        $seen = (array) get_option('rl_sync_seen_ids', array());
+        update_option('rl_sync_seen_ids', array_values(array_unique(array_merge($seen, array_map('strval', $res['ids'])))), false);
+    }
     if (!empty($res['done'])) { $k++; $o = 0; } else { $o = isset($res['next_offset']) ? (int) $res['next_offset'] : ($o + $batch); }
     $all_done = ($k >= count($keys));
-    if ($all_done) { delete_option('rl_sync_cursor'); update_option('uplisting_last_sync_time', time()); }
+    $reconciled = null;
+    if ($all_done) {
+        $reconciled = rl_reconcile_missing((array) get_option('rl_sync_seen_ids', array()));
+        delete_option('rl_sync_cursor');
+        delete_option('rl_sync_seen_ids');
+        update_option('uplisting_last_sync_time', time());
+    }
     else { update_option('rl_sync_cursor', array('k' => $k, 'o' => $o)); }
-    return array('key_index' => $k, 'key_count' => count($keys), 'offset' => $o, 'properties_for_key' => isset($res['total']) ? $res['total'] : null, 'processed' => isset($res['processed']) ? $res['processed'] : 0, 'key_done' => !empty($res['done']), 'all_done' => $all_done);
+    return array('key_index' => $k, 'key_count' => count($keys), 'offset' => $o, 'properties_for_key' => isset($res['total']) ? $res['total'] : null, 'processed' => isset($res['processed']) ? $res['processed'] : 0, 'key_done' => !empty($res['done']), 'all_done' => $all_done, 'reconciled' => $reconciled);
 }
+
+/**
+ * Draft any published property whose Uplisting id was not returned anywhere in the pass that just
+ * finished. Without this, a property deleted from the Uplisting account is never visited by the
+ * import loop and stays published on the website for ever.
+ *
+ * Refuses to act on an implausible id list, so one failed API pass can never unpublish the site.
+ *
+ * @param string[] $seen_ids Every Uplisting id returned during the pass.
+ * @return array Summary.
+ */
+function rl_reconcile_missing($seen_ids) {
+    $seen_ids = array_values(array_unique(array_map('strval', (array) $seen_ids)));
+
+    $published = get_posts(array(
+        'post_type'      => 'rental_property',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+    ));
+
+    if (empty($seen_ids)) {
+        return array('skipped' => 'api returned no property ids', 'published' => count($published));
+    }
+    if (count($published) > 0 && count($seen_ids) < 0.4 * count($published)) {
+        return array(
+            'skipped'   => 'api returned ' . count($seen_ids) . ' ids against ' . count($published) . ' published — below the 40% guard',
+            'published' => count($published),
+        );
+    }
+
+    $lookup  = array_flip($seen_ids);
+    $drafted = array();
+
+    foreach ($published as $post_id) {
+        $upl_id = (string) get_post_meta($post_id, '_uplisting_id', true);
+        if ('' === $upl_id || isset($lookup[$upl_id])) continue;
+        wp_update_post(array('ID' => $post_id, 'post_status' => 'draft'));
+        update_post_meta($post_id, '_rental_status', 'Disabled');
+        update_post_meta($post_id, '_rental_gone_from_api', time());
+        $drafted[] = array('post_id' => (int) $post_id, 'uplisting_id' => $upl_id, 'title' => get_the_title($post_id));
+    }
+
+    return array('api_ids' => count($seen_ids), 'published_before' => count($published), 'drafted' => $drafted);
+}
+
+/**
+ * Raw attribute dump for a handful of properties, so two that Uplisting treats differently can be
+ * diffed attribute by attribute. Administrators only.
+ *
+ *   /wp-admin/?rl_raw=1&ids=88898,88900,88901,88902
+ */
+add_action('admin_init', function () {
+    if (empty($_GET['rl_raw'])) { return; }
+    if (!current_user_can('manage_options')) { return; }
+    if (!class_exists('Uplisting_Client')) { wp_send_json(array('error' => 'classes not loaded')); }
+
+    $wanted = array_values(array_filter(array_map('trim', explode(',', (string) ($_GET['ids'] ?? '')))));
+    if (empty($wanted)) { wp_send_json(array('error' => 'pass ids=1,2,3')); }
+    $wanted = array_flip($wanted);
+
+    @set_time_limit(0);
+
+    $keys = array_values(array_filter(array_map('trim', (array) get_option('uplisting_api_keys', array()))));
+    $out  = array();
+    $all_keys_seen = array();
+
+    foreach ($keys as $i => $key) {
+        $client = new Uplisting_Client(array($key));
+        $resp   = $client->get_properties_all();
+        foreach (($resp['data'] ?? array()) as $property) {
+            $id = (string) ($property['id'] ?? '');
+            if ('' === $id || !isset($wanted[$id])) continue;
+
+            $attrs = $property['attributes'] ?? array();
+            foreach (array_keys($attrs) as $attr_key) { $all_keys_seen[$attr_key] = true; }
+
+            $out[$id] = array(
+                'account'       => $i + 1,
+                'attributes'    => $attrs,
+                'relationships' => array_keys($property['relationships'] ?? array()),
+            );
+        }
+    }
+
+    wp_send_json(array(
+        'requested'      => array_keys($wanted),
+        'found'          => array_keys($out),
+        'attribute_keys' => array_keys($all_keys_seen),
+        'properties'     => $out,
+    ));
+});
+
+/**
+ * Audit screen: what the API returns, what would be live, and what WordPress currently shows.
+ * Administrators only.
+ *
+ *   /wp-admin/?rl_audit=1
+ */
+add_action('admin_init', function () {
+    if (empty($_GET['rl_audit'])) { return; }
+    if (!current_user_can('manage_options')) { return; }
+    if (!class_exists('Uplisting_Sync') || !class_exists('Uplisting_Client')) { wp_send_json(array('error' => 'classes not loaded')); }
+
+    @set_time_limit(0);
+
+    $keys = array_values(array_filter(array_map('trim', (array) get_option('uplisting_api_keys', array()))));
+    if (empty($keys)) { wp_send_json(array('error' => 'no api keys configured')); }
+
+    // ?cal=1 also reads each property's calendar, so the availability-based rule can be counted.
+    // That is one extra API call per property, throttled — expect ~10s for 35 properties.
+    $with_cal = !empty($_GET['cal']);
+    $months   = isset($_GET['months']) ? max(1, intval($_GET['months'])) : Uplisting_Sync::availability_months();
+
+    $rows = array();
+    $api_ids = array();
+    $live_ids = array();
+    $availability_ids = array();
+
+    foreach ($keys as $i => $key) {
+        $client = new Uplisting_Client(array($key));
+        $sync   = new Uplisting_Sync($client, $key);
+        $inv    = $sync->inventory($with_cal, $months);
+
+        $api_ids  = array_merge($api_ids, $inv['all']);
+        $live_ids = array_merge($live_ids, $inv['live']);
+        $from_availability = $sync->live_ids();
+        if (is_array($from_availability)) $availability_ids = array_merge($availability_ids, $from_availability);
+
+        foreach ($inv['rows'] as $row) {
+            $row['account'] = $i + 1;
+
+            $existing = get_posts(array(
+                'post_type'      => 'rental_property',
+                'meta_key'       => '_uplisting_id',
+                'meta_value'     => $row['id'],
+                'posts_per_page' => 1,
+                'fields'         => 'ids',
+                'post_status'    => 'any',
+            ));
+            $row['wp_post_id'] = !empty($existing) ? (int) $existing[0] : null;
+            $row['wp_status']  = $row['wp_post_id'] ? get_post_status($row['wp_post_id']) : null;
+            $row['wp_rental_status'] = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_status', true) : null;
+
+            // The "from" price is what the direct booking site prints on each card, so it is the
+            // handle for matching a card that renders without its title.
+            $row['from_price'] = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_from_price', true) : null;
+            $row['city']       = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_city', true) : null;
+
+            $rows[] = $row;
+        }
+    }
+
+    // What the unfiltered listing page actually renders today.
+    $shown = get_posts(array(
+        'post_type'      => 'rental_property',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+        'meta_query'     => array(array('key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=')),
+    ));
+
+    $orphans = array();
+    $api_lookup = array_flip(array_map('strval', $api_ids));
+    foreach ($shown as $post_id) {
+        $upl_id = (string) get_post_meta($post_id, '_uplisting_id', true);
+        if ('' === $upl_id || !isset($api_lookup[$upl_id])) {
+            $orphans[] = array('post_id' => (int) $post_id, 'uplisting_id' => $upl_id, 'title' => get_the_title($post_id));
+        }
+    }
+
+    $availability_ids = array_values(array_unique($availability_ids));
+
+    // How many properties each candidate rule would show, so the one matching the direct booking
+    // sites can be picked on evidence instead of guessed.
+    $counts = array('availability_endpoint' => count($availability_ids), 'status_only' => 0, 'status_and_site' => 0);
+    if ($with_cal) { $counts['status_site_availability'] = 0; $counts['calendar_unreadable'] = 0; }
+    $availability_lookup = array_flip($availability_ids);
+    foreach ($rows as $i => $row) {
+        $rows[$i]['in_availability_endpoint'] = isset($availability_lookup[$row['id']]);
+        if (!empty($row['rule_status_only'])) $counts['status_only']++;
+        if (!empty($row['rule_status_site'])) $counts['status_and_site']++;
+        if ($with_cal) {
+            if (!empty($row['rule_status_site_availability'])) $counts['status_site_availability']++;
+            if (empty($row['calendar_readable'])) $counts['calendar_unreadable']++;
+        }
+    }
+
+    // The concrete work the next sync will do, so the outcome can be checked before running it.
+    $to_publish = array();
+    $to_draft   = array();
+    foreach ($rows as $row) {
+        if (true === $row['should_publish'] && 'publish' !== $row['wp_status']) {
+            $to_publish[] = $row['id'] . ' — ' . $row['name'];
+        }
+        if (false === $row['should_publish'] && 'publish' === $row['wp_status']) {
+            $to_draft[] = $row['id'] . ' — ' . $row['name'];
+        }
+    }
+
+    wp_send_json(array(
+        'accounts'                  => count($keys),
+        'properties_from_api'       => count(array_unique($api_ids)),
+        'next_sync_will_publish'    => $to_publish,
+        'next_sync_will_draft'      => $to_draft,
+        'forced_draft_ids'          => Uplisting_Sync::forced_ids('rl_force_draft_ids'),
+        'forced_publish_ids'        => Uplisting_Sync::forced_ids('rl_force_publish_ids'),
+        'active_rule'               => Uplisting_Sync::publish_rule(),
+        'availability_months'       => $months,
+        'counts_by_rule'            => $counts,
+        'availability_endpoint_ids' => $availability_ids,
+        'live_by_current_rule'      => count(array_unique($live_ids)),
+        'shown_on_site_now'         => count($shown),
+        'shown_but_absent_from_api' => $orphans,
+        'sync_paused'               => get_option('rl_sync_paused', '1'),
+        'last_sync'                 => get_option('uplisting_last_sync_time') ? gmdate('c', (int) get_option('uplisting_last_sync_time')) : null,
+        'properties'                => $rows,
+    ));
+});
 
 add_action('rl_sync_continue', function () {
     if (get_option('rl_sync_cursor', false) === false) { return; }
+    // Someone is driving the pass from the settings screen; two runners on one cursor would
+    // import the same properties twice and scramble the offset.
+    if (get_transient('rl_sync_lock')) {
+        if (!wp_next_scheduled('rl_sync_continue')) wp_schedule_single_event(time() + 120, 'rl_sync_continue');
+        return;
+    }
     @set_time_limit(0); @ini_set('memory_limit', '256M');
     rl_sync_tick(2);
     if (get_option('rl_sync_cursor', false) !== false && !wp_next_scheduled('rl_sync_continue')) {
@@ -793,8 +1206,97 @@ add_action('admin_init', function () {
     if (empty($_GET['rl_sync_run'])) { return; }
     if (!current_user_can('manage_options')) { return; }
     @set_time_limit(0); @ini_set('memory_limit', '256M');
-    if (!empty($_GET['reset'])) { update_option('rl_sync_cursor', array('k' => 0, 'o' => 0)); }
+    if (!empty($_GET['reset'])) {
+        update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
+        // A restarted pass must not inherit ids seen in the abandoned one, or reconciliation
+        // would spare properties the API no longer returns.
+        delete_option('rl_sync_seen_ids');
+        // Start from fresh API snapshots too.
+        foreach ((array) get_option('uplisting_api_keys', array()) as $k) {
+            delete_transient('rl_props_' . md5(trim($k)));
+            delete_transient('rl_live_ids_' . md5(trim($k)));
+        }
+    }
     $n = isset($_GET['n']) ? max(1, intval($_GET['n'])) : 2;
     $dry = !empty($_GET['dry']);
-    wp_send_json(rl_sync_tick($n, $dry));
+
+    // ?all=1 keeps ticking until the pass finishes or the time budget runs out, instead of
+    // making someone reload the URL once per couple of properties.
+    if (!empty($_GET['all']) && !$dry) {
+        $budget  = isset($_GET['seconds']) ? min(300, max(10, intval($_GET['seconds']))) : 45;
+        $started = time();
+        $ticks   = 0;
+        $res     = array();
+
+        do {
+            $res = rl_sync_tick($n);
+            $ticks++;
+            if (!empty($res['error'])) break;
+        } while (empty($res['all_done']) && (time() - $started) < $budget);
+
+        $res['ticks']   = $ticks;
+        $res['seconds'] = time() - $started;
+        if (empty($res['all_done'])) {
+            rl_schedule_continue();
+            $res['resume'] = 'not finished — reload this URL, or let the scheduled rl_sync_continue carry on';
+        }
+        wp_send_json($res);
+    }
+
+    $res = rl_sync_tick($n, $dry);
+    if (!$dry && empty($res['all_done'])) rl_schedule_continue();
+    wp_send_json($res);
 });
+
+/**
+ * One chunk of a pass, called repeatedly by the settings screen so a single press runs the whole
+ * sync. Each call works for about twenty seconds, which keeps it clear of PHP and proxy timeouts,
+ * then reports progress for the bar.
+ */
+add_action('wp_ajax_rl_sync_step', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(array('message' => 'Not allowed'), 403);
+    check_ajax_referer('rl_sync_step', 'nonce');
+
+    if (!function_exists('rl_sync_tick')) wp_send_json_error(array('message' => 'Sync not loaded'), 500);
+
+    @set_time_limit(0);
+    @ini_set('memory_limit', '256M');
+
+    if (!empty($_POST['restart'])) {
+        update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
+        delete_option('rl_sync_seen_ids');
+        foreach ((array) get_option('uplisting_api_keys', array()) as $k) {
+            delete_transient('rl_props_' . md5(trim($k)));
+            delete_transient('rl_live_ids_' . md5(trim($k)));
+        }
+    }
+
+    // Hold the lock for the duration so the background job does not process the same cursor.
+    set_transient('rl_sync_lock', 1, 120);
+
+    $started = time();
+    $res = array();
+    do {
+        $res = rl_sync_tick(5);
+        if (!empty($res['error'])) break;
+    } while (empty($res['all_done']) && (time() - $started) < 20);
+
+    delete_transient('rl_sync_lock');
+
+    // Only hand off to cron once the browser stops driving.
+    if (!empty($res['error'])) rl_schedule_continue();
+
+    wp_send_json_success($res);
+});
+
+/**
+ * Queue the next chunk of an unfinished pass. The manual runner never did this, so a pass started
+ * by hand only advanced while someone kept reloading.
+ *
+ * @return void
+ */
+function rl_schedule_continue() {
+    if (get_option('rl_sync_cursor', false) !== false && !wp_next_scheduled('rl_sync_continue')) {
+        wp_schedule_single_event(time() + 60, 'rl_sync_continue');
+    }
+}

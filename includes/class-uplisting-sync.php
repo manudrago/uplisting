@@ -5,6 +5,7 @@ require_once ABSPATH . 'wp-admin/includes/file.php';
 class Uplisting_Sync {
     private $client;
     private $current_api_key;
+    private $live_ids_cache = false;
 
     public function __construct($client, $api_key = null) {
         $this->client = $client;
@@ -14,7 +15,7 @@ class Uplisting_Sync {
     public function sync_all_properties() {
         error_log('Fetching properties for API key: ' . substr($this->current_api_key ?? 'N/A', 0, 6));
         
-        $properties = $this->client->get_properties_all();
+        $properties = $this->properties_payload();
         if (empty($properties['data'])) return;
 
         foreach ($properties['data'] as $property) {
@@ -27,7 +28,7 @@ class Uplisting_Sync {
     }
 
     public function sync_batch($offset = 0, $limit = 2, $dry = false) {
-        $properties = $this->client->get_properties_all();
+        $properties = $this->properties_payload();
         $data = (isset($properties['data']) && is_array($properties['data'])) ? $properties['data'] : array();
         $included = isset($properties['included']) ? $properties['included'] : array();
         $total = count($data);
@@ -39,7 +40,243 @@ class Uplisting_Sync {
             catch (\Throwable $e) { error_log('Uplisting batch import failed: ' . $e->getMessage()); }
             usleep(500000);
         }
-        return array('total' => $total, 'next_offset' => $end, 'processed' => $processed, 'done' => ($end >= $total));
+        $ids = array();
+        foreach ($data as $row) { if (!empty($row['id'])) $ids[] = (string) $row['id']; }
+
+        return array('total' => $total, 'next_offset' => $end, 'processed' => $processed, 'done' => ($end >= $total), 'ids' => $ids);
+    }
+
+    /**
+     * GET /properties for the current key, cached for the duration of a pass.
+     *
+     * The cursor-based sync calls this on every tick, and the payload is the whole account with
+     * photos, amenities, fees, taxes and policies inlined — refetching it once per two properties
+     * was most of each tick's wall time. Caching it also gives the pass a consistent snapshot,
+     * which is what reconciliation should be comparing against.
+     *
+     * @return array
+     */
+    private function properties_payload() {
+        $transient = 'rl_props_' . md5((string) $this->current_api_key);
+
+        $cached = get_transient($transient);
+        if (is_array($cached) && !empty($cached['data'])) return $cached;
+
+        $payload = $this->client->get_properties_all();
+        if (!empty($payload['data'])) set_transient($transient, $payload, 15 * MINUTE_IN_SECONDS);
+
+        return $payload;
+    }
+
+    /**
+     * The property ids GET /availability returns with no search criteria.
+     *
+     * Per the Uplisting docs that endpoint answers with "a list of properties that meet the search
+     * criteria", and every criterion is optional — so with none supplied it is the account's
+     * sellable set, which is exactly what the direct booking site lists. GET /properties, by
+     * contrast, returns the whole account and carries no visibility field at all.
+     *
+     * Returns null when the answer cannot be trusted (API error, or an empty list), so an outage
+     * can never be read as "nothing is live".
+     *
+     * @return string[]|null
+     */
+    public function live_ids() {
+        if (false !== $this->live_ids_cache) return $this->live_ids_cache;
+
+        $transient = 'rl_live_ids_' . md5((string) $this->current_api_key);
+        $cached = get_transient($transient);
+        if (is_array($cached) && $cached) {
+            $this->live_ids_cache = $cached;
+            return $cached;
+        }
+
+        $resp = $this->client->get_availability();
+        if (!is_array($resp) || isset($resp['error']) || empty($resp['data']) || !is_array($resp['data'])) {
+            $this->live_ids_cache = null;
+            return null;
+        }
+
+        $ids = array();
+        foreach ($resp['data'] as $prop) {
+            if (!empty($prop['id'])) $ids[] = (string) $prop['id'];
+        }
+        $ids = array_values(array_unique($ids));
+
+        if (empty($ids)) { $this->live_ids_cache = null; return null; }
+
+        // Short cache so the cursor-based sync does not refetch on every tick.
+        set_transient($transient, $ids, 10 * MINUTE_IN_SECONDS);
+        $this->live_ids_cache = $ids;
+        return $ids;
+    }
+
+    /** Values of the Uplisting status attribute that mean "not live". */
+    const INACTIVE_STATUSES = array('disabled', 'inactive', 'paused', 'archived', 'deleted', 'unlisted', 'draft');
+
+    /**
+     * @param string $status Lower-cased Uplisting status.
+     * @return bool
+     */
+    public static function is_enabled($status) {
+        return !in_array($status, self::INACTIVE_STATUSES, true);
+    }
+
+    /**
+     * The single place that decides whether a property is live. Filterable so the rule can be
+     * tuned against the real property count without touching the importer.
+     *
+     * @param string $status     Lower-cased Uplisting status.
+     * @param string $upl_domain Direct booking domain from the API.
+     * @param string $upl_slug   Property slug from the API.
+     * @return bool
+     */
+    /**
+     * Which rule decides visibility. Set with: wp option update rl_publish_rule <value>
+     *
+     *   availability_endpoint    returned by GET /availability, unfiltered       (default)
+     *   status_only              enabled on the Uplisting account
+     *   status_and_site          + published to a direct booking domain
+     *   status_site_availability + at least one bookable day in the window
+     */
+    public static function publish_rule() {
+        $rule = (string) get_option('rl_publish_rule', 'availability_endpoint');
+        return in_array($rule, array('availability_endpoint', 'status_only', 'status_and_site', 'status_site_availability'), true)
+            ? $rule
+            : 'availability_endpoint';
+    }
+
+    /** Months of calendar the availability arm of the rule looks at. */
+    public static function availability_months() {
+        return max(1, (int) get_option('rl_availability_months', 4));
+    }
+
+    /**
+     * @param array $signals status, domain, slug, has_availability (bool|null), in_live_set (bool|null).
+     * @return bool|null True publish, false draft, null undecidable — leave the post alone.
+     */
+    /**
+     * Uplisting ids listed in an option always win over the rule. For the odd property the direct
+     * booking site treats differently from its own availability feed, and for anything the client
+     * wants held back or forced out, without touching code:
+     *
+     *     wp option update rl_force_draft_ids   "231459,245362"
+     *     wp option update rl_force_publish_ids "88898"
+     *
+     * @param string $option
+     * @return string[]
+     */
+    public static function forced_ids($option) {
+        $raw = get_option($option, '');
+        if (is_array($raw)) $raw = implode(',', $raw);
+        return array_values(array_filter(array_map('trim', explode(',', (string) $raw))));
+    }
+
+    public static function should_publish(array $signals) {
+        $rule   = self::publish_rule();
+        $status = (string) ($signals['status'] ?? 'enabled');
+        $domain = (string) ($signals['domain'] ?? '');
+        $slug   = (string) ($signals['slug'] ?? '');
+        $id     = (string) ($signals['id'] ?? '');
+
+        if ('' !== $id) {
+            if (in_array($id, self::forced_ids('rl_force_draft_ids'), true))   return false;
+            if (in_array($id, self::forced_ids('rl_force_publish_ids'), true)) return true;
+        }
+
+        if ('availability_endpoint' === $rule) {
+            $in_live_set = $signals['in_live_set'] ?? null;
+            // Unreadable live set means undecidable, never "draft everything".
+            $publish = (null === $in_live_set) ? null : (bool) $in_live_set;
+            return apply_filters('rl_property_should_publish', $publish, $status, $domain, $slug);
+        }
+
+        $publish = self::is_enabled($status);
+
+        if ('status_only' !== $rule) {
+            $publish = $publish && '' !== trim($domain) && '' !== trim($slug);
+        }
+
+        if ('status_site_availability' === $rule && $publish) {
+            $has_availability = $signals['has_availability'] ?? null;
+            if (null === $has_availability) return apply_filters('rl_property_should_publish', null, $status, $domain, $slug);
+            $publish = (bool) $has_availability;
+        }
+
+        return apply_filters('rl_property_should_publish', (bool) $publish, $status, $domain, $slug);
+    }
+
+    /**
+     * Every property id the current key returns, and the subset that should be live. Used by the
+     * reconciliation pass and by the audit screen.
+     *
+     * @return array{all: string[], live: string[], rows: array[]}
+     */
+    public function inventory($with_availability = false, $months = 4) {
+        $properties = $this->properties_payload();
+        $data = (isset($properties['data']) && is_array($properties['data'])) ? $properties['data'] : array();
+
+        $all = array();
+        $live = array();
+        $rows = array();
+        $live_ids = $this->live_ids();
+
+        foreach ($data as $property) {
+            $id = (string) ($property['id'] ?? '');
+            if ('' === $id) continue;
+
+            $attrs = $property['attributes'] ?? array();
+
+            $status_raw = $attrs['status'] ?? (isset($attrs['enabled']) ? ($attrs['enabled'] ? 'enabled' : 'disabled') : 'enabled');
+            if (is_bool($status_raw)) { $status_raw = $status_raw ? 'enabled' : 'disabled'; }
+            $status = strtolower(trim((string) $status_raw));
+
+            $domain = (string) ($attrs['uplisting_domain'] ?? '');
+            $slug   = (string) ($attrs['property_slug'] ?? '');
+
+            $row = array(
+                'id'               => $id,
+                'name'             => (string) ($attrs['name'] ?? ''),
+                'status'           => $status,
+                'uplisting_domain' => $domain,
+                'property_slug'    => $slug,
+                'rule_status_only' => self::is_enabled($status),
+                'rule_status_site' => self::is_enabled($status) && '' !== trim($domain) && '' !== trim($slug),
+            );
+
+            // Multi-unit properties render differently on the direct booking site, so count them.
+            $row['multi_units'] = count($property['relationships']['multi_units']['data'] ?? array());
+            $row['has_address'] = !empty($property['relationships']['address']['data']['id']);
+
+            if ($with_availability) {
+                $window = $this->availability_window($id, $months);
+                $row['calendar_readable'] = (null !== $window);
+                $row['days_total']        = $window ? $window['days_total'] : null;
+                $row['days_available']    = $window ? $window['days_available'] : null;
+                $row['rule_status_site_availability'] = $row['rule_status_site'] && $window && $window['days_available'] > 0;
+                usleep(250000); // 4 req/sec, inside Uplisting's 5/sec and 100/min limits.
+            }
+
+            $row['in_live_set'] = (null === $live_ids) ? null : in_array($id, $live_ids, true);
+            $row['rule_availability_endpoint'] = (true === $row['in_live_set']);
+
+            $should = self::should_publish(array(
+                'id'               => $id,
+                'status'           => $status,
+                'domain'           => $domain,
+                'slug'             => $slug,
+                'has_availability' => (isset($row['days_available']) && null !== $row['days_available']) ? ($row['days_available'] > 0) : null,
+                'in_live_set'      => $row['in_live_set'],
+            ));
+            $row['should_publish'] = $should;
+
+            $all[] = $id;
+            if (true === $should) $live[] = $id;
+
+            $rows[] = $row;
+        }
+
+        return array('all' => $all, 'live' => $live, 'rows' => $rows);
     }
 
     private function import_property($property, $included) {
@@ -60,7 +297,8 @@ class Uplisting_Sync {
         $upl_slug     = sanitize_text_field($attrs['property_slug'] ?? '');
 
         $status_raw   = $attrs['status'] ?? (isset($attrs['enabled']) ? ($attrs['enabled'] ? 'enabled' : 'disabled') : 'enabled');
-        $status       = strtolower($status_raw);
+        if (is_bool($status_raw)) { $status_raw = $status_raw ? 'enabled' : 'disabled'; }
+        $status       = strtolower(trim((string) $status_raw));
 
         // Address
         if (!empty($rels['address']['data']['id'])) {
@@ -87,11 +325,38 @@ class Uplisting_Sync {
         ]);
         $post_id = !empty($existing) ? intval($existing[0]) : 0;
 
-        // FETCH CALENDAR DATA FIRST to determine post status
-        $has_availability = $this->check_availability_next_4_months($uplisting_id);
-        
-        // Determine post status: draft if no availability, publish if available
-        $post_status = $has_availability ? 'publish' : 'draft';
+        // Mirror the Uplisting direct booking site (*.bookeddirectly.host). Which test does that is
+        // set by the rl_publish_rule option; each arm fetches only what it needs.
+        $rule = self::publish_rule();
+
+        $has_availability = null;
+        if ('status_site_availability' === $rule) {
+            $window = $this->availability_window($uplisting_id, self::availability_months());
+            $has_availability = (null === $window) ? null : ($window['days_available'] > 0);
+        }
+
+        $in_live_set = null;
+        if ('availability_endpoint' === $rule) {
+            $live = $this->live_ids();
+            $in_live_set = (null === $live) ? null : in_array((string) $uplisting_id, $live, true);
+        }
+
+        $decision = self::should_publish(array(
+            'id'               => (string) $uplisting_id,
+            'status'           => $status,
+            'domain'           => $upl_domain,
+            'slug'             => $upl_slug,
+            'has_availability' => $has_availability,
+            'in_live_set'      => $in_live_set,
+        ));
+
+        // Undecidable (calendar unreadable) leaves an existing post exactly as it is; a brand new
+        // one is parked as a draft rather than guessed into publication.
+        if (null === $decision) {
+            $post_status = $post_id ? get_post_status($post_id) : 'draft';
+        } else {
+            $post_status = $decision ? 'publish' : 'draft';
+        }
 
         $post_data = [
             'post_title'   => $title,
@@ -117,8 +382,14 @@ class Uplisting_Sync {
             update_post_meta($post_id, '_uplisting_account_key', md5($this->current_api_key));
         }
 
-        // Basic meta
-        update_post_meta($post_id, '_rental_status', $status);
+        // Basic meta. _rental_status is normalised to exactly Enabled/Disabled because the
+        // listing and map queries compare against 'Enabled'; the untouched API value is kept
+        // alongside it for debugging.
+        if (null !== $decision) {
+            update_post_meta($post_id, '_rental_status', $decision ? 'Enabled' : 'Disabled');
+        }
+        update_post_meta($post_id, '_rental_status_raw', $status);
+        update_post_meta($post_id, '_rental_on_booking_site', ($upl_domain && $upl_slug) ? 1 : 0);
         update_post_meta($post_id, '_rental_city', $city);
         update_post_meta($post_id, '_rental_address', $address);
         update_post_meta($post_id, '_rental_lat', $lat);
@@ -163,27 +434,36 @@ class Uplisting_Sync {
         }
         update_post_meta($post_id, '_rental_amenities', $amenities);
 
-        // Gallery
-        $gallery = [];
+        // Gallery. Collect the URLs first: if the photo set is unchanged since the last import,
+        // the whole pass — one attachment lookup and possibly one download per photo — is skipped.
+        // Re-running the sync on an already-imported account was spending most of its time here.
+        $photo_urls = array();
         if (!empty($rels['photos']['data'])) {
             foreach ($rels['photos']['data'] as $photo_ref) {
                 $photo_id = $photo_ref['id'] ?? null;
                 if (!$photo_id) continue;
-        
+
                 $photo_item = $this->find_included_item($included, 'photos', $photo_id);
                 $img_url = $photo_item['attributes']['url'] ?? '';
-        
-                if ($img_url) {
-                    $attachment_id = $this->import_image($img_url, $post_id);
-                    if ($attachment_id) {
-                        $gallery[] = $attachment_id;
-                    } else {
-                        $gallery[] = esc_url($img_url);
-                    }
-                }
+                if ($img_url) $photo_urls[] = $img_url;
             }
         }
-        update_post_meta($post_id, '_rental_gallery', $gallery);
+
+        $photo_hash    = md5(implode('|', $photo_urls));
+        $stored_hash   = (string) get_post_meta($post_id, '_rental_gallery_hash', true);
+        $stored_galery = get_post_meta($post_id, '_rental_gallery', true);
+
+        if ($photo_hash === $stored_hash && !empty($stored_galery) && is_array($stored_galery)) {
+            $gallery = $stored_galery;
+        } else {
+            $gallery = array();
+            foreach ($photo_urls as $img_url) {
+                $attachment_id = $this->import_image($img_url, $post_id);
+                $gallery[] = $attachment_id ? $attachment_id : esc_url($img_url);
+            }
+            update_post_meta($post_id, '_rental_gallery', $gallery);
+            update_post_meta($post_id, '_rental_gallery_hash', $photo_hash);
+        }
 
         // Featured image = FIRST image in the Uplisting gallery
         if (!empty($gallery) && is_numeric($gallery[0])) {
@@ -263,13 +543,22 @@ class Uplisting_Sync {
     }
 
     /**
-     * Check if property has any availability in the next 4 months
+     * Bookable days in the next N months.
+     *
+     * Returns null when the calendar could not be read at all — an API error, an empty envelope,
+     * a missing key. The old code returned false in that case, which was indistinguishable from a
+     * genuinely full calendar and silently drafted live properties whenever Uplisting hiccuped.
+     *
+     * @param int|string $uplisting_id
+     * @param int        $months
+     * @return array{days_total:int, days_available:int}|null
      */
-    private function check_availability_next_4_months($uplisting_id) {
-        if (!$this->current_api_key || !$uplisting_id) return false;
+    public function availability_window($uplisting_id, $months = 4) {
+        if (!$this->current_api_key || !$uplisting_id) return null;
 
+        $months = max(1, (int) $months);
         $from = date('Y-m-d');
-        $to = date('Y-m-d', strtotime('+4 months'));
+        $to   = date('Y-m-d', strtotime('+' . $months . ' months'));
 
         $calendar_data = $this->client->get_calendar_for_key(
             $this->current_api_key,
@@ -278,18 +567,16 @@ class Uplisting_Sync {
             $to
         );
 
-        if (empty($calendar_data['calendar']['days'])) return false;
+        if (!is_array($calendar_data) || isset($calendar_data['error'])) return null;
+        if (!isset($calendar_data['calendar']['days']) || !is_array($calendar_data['calendar']['days'])) return null;
 
         $days = $calendar_data['calendar']['days'];
-        
-        // Check if ANY day in the next 4 months is available
+        $available = 0;
         foreach ($days as $day) {
-            if (!empty($day['available']) && isset($day['day_rate'])) {
-                return true; // Found at least one available day
-            }
+            if (!empty($day['available']) && isset($day['day_rate'])) $available++;
         }
 
-        return false; // No available days found
+        return array('days_total' => count($days), 'days_available' => $available);
     }
 
     /**
@@ -395,14 +682,16 @@ class Uplisting_Sync {
     }
 
     private function find_existing_attachment($url_clean) {
-        $q = new WP_Query([
-            'post_type'      => 'attachment',
-            'meta_key'       => '_source_url',
-            'meta_value'     => esc_url($url_clean),
-            'posts_per_page' => 1,
-            'fields'         => 'ids'
-        ]);
-        return !empty($q->posts) ? $q->posts[0] : false;
+        global $wpdb;
+
+        // A full WP_Query per photo — twenty-five of them per property — was the bulk of each
+        // property's import time. This is the same lookup as one indexed statement.
+        $id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_source_url' AND meta_value = %s LIMIT 1",
+            esc_url($url_clean)
+        ));
+
+        return $id ? (int) $id : false;
     }
     
     /**

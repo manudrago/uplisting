@@ -32,6 +32,10 @@ if (!isset($query) || !$query instanceof WP_Query) {
         'meta_query'     => $meta_query,
     ];
     $query = new WP_Query($args);
+
+    // The map is built from the same clauses. Unfiltered that is just the Enabled check, so it
+    // shows every property, as it always has.
+    $rl_map_meta = $meta_query;
 }
 ?>
 
@@ -180,14 +184,29 @@ if (!isset($query) || !$query instanceof WP_Query) {
 </div>
 
 <?php
-// Map data: ALL enabled properties (not just the current page)
+// Map data: the properties matching the current search, across all pages.
+//
+// $rl_map_meta is set by whoever built the listing query — this file on a direct page load, or
+// ajax_filter() on a search — and holds the clauses that query used. Reading them back off the
+// WP_Query instead did not work: get('meta_query') came back empty, the fallback took over, and
+// the map showed the whole portfolio while the grid showed four results.
+//
+// Do not rebuild this from $query->query_vars either. A query that has already run carries
+// nopaging => false, WP_Query only infers nopaging from posts_per_page when the var is absent, and
+// the combination builds "LIMIT 0, -1" — which MySQL rejects, leaving the map blank.
+$map_meta = isset($rl_map_meta) && !empty($rl_map_meta)
+    ? $rl_map_meta
+    : [[ 'key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=' ]];
+
 $map_query = new WP_Query([
     'post_type'      => 'rental_property',
     'post_status'    => 'publish',
     'posts_per_page' => -1,
+    'nopaging'       => true,
+    'no_found_rows'  => true,
     'orderby'        => 'title',
     'order'          => 'ASC',
-    'meta_query'     => [[ 'key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=' ]],
+    'meta_query'     => $map_meta,
 ]);
 $map_props = [];
 while ($map_query->have_posts()) { $map_query->the_post();
@@ -210,4 +229,7 @@ while ($map_query->have_posts()) { $map_query->the_post();
 }
 wp_reset_postdata();
 ?>
+<?php // A data attribute rather than a script tag: this markup is also returned over AJAX, and
+      // jQuery strips script elements out of a parsed response. ?>
+<div id="rental-map-data" data-props="<?php echo esc_attr(wp_json_encode($map_props)); ?>" style="display:none"></div>
 <script>window.rentalAllProperties = <?php echo wp_json_encode($map_props); ?>;</script>
