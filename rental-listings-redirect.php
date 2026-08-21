@@ -975,9 +975,25 @@ add_action('admin_init', function () {
         }
     }
 
+    // The concrete work the next sync will do, so the outcome can be checked before running it.
+    $to_publish = array();
+    $to_draft   = array();
+    foreach ($rows as $row) {
+        if (true === $row['should_publish'] && 'publish' !== $row['wp_status']) {
+            $to_publish[] = $row['id'] . ' — ' . $row['name'];
+        }
+        if (false === $row['should_publish'] && 'publish' === $row['wp_status']) {
+            $to_draft[] = $row['id'] . ' — ' . $row['name'];
+        }
+    }
+
     wp_send_json(array(
         'accounts'                  => count($keys),
         'properties_from_api'       => count(array_unique($api_ids)),
+        'next_sync_will_publish'    => $to_publish,
+        'next_sync_will_draft'      => $to_draft,
+        'forced_draft_ids'          => Uplisting_Sync::forced_ids('rl_force_draft_ids'),
+        'forced_publish_ids'        => Uplisting_Sync::forced_ids('rl_force_publish_ids'),
         'active_rule'               => Uplisting_Sync::publish_rule(),
         'availability_months'       => $months,
         'counts_by_rule'            => $counts,

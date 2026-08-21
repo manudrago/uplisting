@@ -133,11 +133,34 @@ class Uplisting_Sync {
      * @param array $signals status, domain, slug, has_availability (bool|null), in_live_set (bool|null).
      * @return bool|null True publish, false draft, null undecidable — leave the post alone.
      */
+    /**
+     * Uplisting ids listed in an option always win over the rule. For the odd property the direct
+     * booking site treats differently from its own availability feed, and for anything the client
+     * wants held back or forced out, without touching code:
+     *
+     *     wp option update rl_force_draft_ids   "231459,245362"
+     *     wp option update rl_force_publish_ids "88898"
+     *
+     * @param string $option
+     * @return string[]
+     */
+    public static function forced_ids($option) {
+        $raw = get_option($option, '');
+        if (is_array($raw)) $raw = implode(',', $raw);
+        return array_values(array_filter(array_map('trim', explode(',', (string) $raw))));
+    }
+
     public static function should_publish(array $signals) {
         $rule   = self::publish_rule();
         $status = (string) ($signals['status'] ?? 'enabled');
         $domain = (string) ($signals['domain'] ?? '');
         $slug   = (string) ($signals['slug'] ?? '');
+        $id     = (string) ($signals['id'] ?? '');
+
+        if ('' !== $id) {
+            if (in_array($id, self::forced_ids('rl_force_draft_ids'), true))   return false;
+            if (in_array($id, self::forced_ids('rl_force_publish_ids'), true)) return true;
+        }
 
         if ('availability_endpoint' === $rule) {
             $in_live_set = $signals['in_live_set'] ?? null;
@@ -212,6 +235,7 @@ class Uplisting_Sync {
             $row['rule_availability_endpoint'] = (true === $row['in_live_set']);
 
             $should = self::should_publish(array(
+                'id'               => $id,
                 'status'           => $status,
                 'domain'           => $domain,
                 'slug'             => $slug,
@@ -292,6 +316,7 @@ class Uplisting_Sync {
         }
 
         $decision = self::should_publish(array(
+            'id'               => (string) $uplisting_id,
             'status'           => $status,
             'domain'           => $upl_domain,
             'slug'             => $upl_slug,
