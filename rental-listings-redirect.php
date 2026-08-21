@@ -773,12 +773,147 @@ function rl_sync_tick($batch = 2, $dry = false) {
     $sync = new Uplisting_Sync($client, $key);
     $res = $sync->sync_batch($o, $batch, $dry);
     if ($dry) { return array('dry' => true, 'key_index' => $k, 'key_count' => count($keys), 'properties_for_key' => isset($res['total']) ? $res['total'] : null); }
+
+    // Remember every id the API returned during this pass, across all keys, so that when the pass
+    // finishes we can draft anything that has silently disappeared from the account.
+    if (!empty($res['ids']) && is_array($res['ids'])) {
+        $seen = (array) get_option('rl_sync_seen_ids', array());
+        update_option('rl_sync_seen_ids', array_values(array_unique(array_merge($seen, array_map('strval', $res['ids'])))), false);
+    }
     if (!empty($res['done'])) { $k++; $o = 0; } else { $o = isset($res['next_offset']) ? (int) $res['next_offset'] : ($o + $batch); }
     $all_done = ($k >= count($keys));
-    if ($all_done) { delete_option('rl_sync_cursor'); update_option('uplisting_last_sync_time', time()); }
+    $reconciled = null;
+    if ($all_done) {
+        $reconciled = rl_reconcile_missing((array) get_option('rl_sync_seen_ids', array()));
+        delete_option('rl_sync_cursor');
+        delete_option('rl_sync_seen_ids');
+        update_option('uplisting_last_sync_time', time());
+    }
     else { update_option('rl_sync_cursor', array('k' => $k, 'o' => $o)); }
-    return array('key_index' => $k, 'key_count' => count($keys), 'offset' => $o, 'properties_for_key' => isset($res['total']) ? $res['total'] : null, 'processed' => isset($res['processed']) ? $res['processed'] : 0, 'key_done' => !empty($res['done']), 'all_done' => $all_done);
+    return array('key_index' => $k, 'key_count' => count($keys), 'offset' => $o, 'properties_for_key' => isset($res['total']) ? $res['total'] : null, 'processed' => isset($res['processed']) ? $res['processed'] : 0, 'key_done' => !empty($res['done']), 'all_done' => $all_done, 'reconciled' => $reconciled);
 }
+
+/**
+ * Draft any published property whose Uplisting id was not returned anywhere in the pass that just
+ * finished. Without this, a property deleted from the Uplisting account is never visited by the
+ * import loop and stays published on the website for ever.
+ *
+ * Refuses to act on an implausible id list, so one failed API pass can never unpublish the site.
+ *
+ * @param string[] $seen_ids Every Uplisting id returned during the pass.
+ * @return array Summary.
+ */
+function rl_reconcile_missing($seen_ids) {
+    $seen_ids = array_values(array_unique(array_map('strval', (array) $seen_ids)));
+
+    $published = get_posts(array(
+        'post_type'      => 'rental_property',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+    ));
+
+    if (empty($seen_ids)) {
+        return array('skipped' => 'api returned no property ids', 'published' => count($published));
+    }
+    if (count($published) > 0 && count($seen_ids) < 0.4 * count($published)) {
+        return array(
+            'skipped'   => 'api returned ' . count($seen_ids) . ' ids against ' . count($published) . ' published — below the 40% guard',
+            'published' => count($published),
+        );
+    }
+
+    $lookup  = array_flip($seen_ids);
+    $drafted = array();
+
+    foreach ($published as $post_id) {
+        $upl_id = (string) get_post_meta($post_id, '_uplisting_id', true);
+        if ('' === $upl_id || isset($lookup[$upl_id])) continue;
+        wp_update_post(array('ID' => $post_id, 'post_status' => 'draft'));
+        update_post_meta($post_id, '_rental_status', 'Disabled');
+        update_post_meta($post_id, '_rental_gone_from_api', time());
+        $drafted[] = array('post_id' => (int) $post_id, 'uplisting_id' => $upl_id, 'title' => get_the_title($post_id));
+    }
+
+    return array('api_ids' => count($seen_ids), 'published_before' => count($published), 'drafted' => $drafted);
+}
+
+/**
+ * Audit screen: what the API returns, what would be live, and what WordPress currently shows.
+ * Administrators only.
+ *
+ *   /wp-admin/?rl_audit=1
+ */
+add_action('admin_init', function () {
+    if (empty($_GET['rl_audit'])) { return; }
+    if (!current_user_can('manage_options')) { return; }
+    if (!class_exists('Uplisting_Sync') || !class_exists('Uplisting_Client')) { wp_send_json(array('error' => 'classes not loaded')); }
+
+    @set_time_limit(0);
+
+    $keys = array_values(array_filter(array_map('trim', (array) get_option('uplisting_api_keys', array()))));
+    if (empty($keys)) { wp_send_json(array('error' => 'no api keys configured')); }
+
+    $rows = array();
+    $api_ids = array();
+    $live_ids = array();
+
+    foreach ($keys as $i => $key) {
+        $client = new Uplisting_Client(array($key));
+        $sync   = new Uplisting_Sync($client, $key);
+        $inv    = $sync->inventory();
+
+        $api_ids  = array_merge($api_ids, $inv['all']);
+        $live_ids = array_merge($live_ids, $inv['live']);
+
+        foreach ($inv['rows'] as $row) {
+            $row['account'] = $i + 1;
+
+            $existing = get_posts(array(
+                'post_type'      => 'rental_property',
+                'meta_key'       => '_uplisting_id',
+                'meta_value'     => $row['id'],
+                'posts_per_page' => 1,
+                'fields'         => 'ids',
+                'post_status'    => 'any',
+            ));
+            $row['wp_post_id'] = !empty($existing) ? (int) $existing[0] : null;
+            $row['wp_status']  = $row['wp_post_id'] ? get_post_status($row['wp_post_id']) : null;
+            $row['wp_rental_status'] = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_status', true) : null;
+
+            $rows[] = $row;
+        }
+    }
+
+    // What the unfiltered listing page actually renders today.
+    $shown = get_posts(array(
+        'post_type'      => 'rental_property',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'fields'         => 'ids',
+        'meta_query'     => array(array('key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=')),
+    ));
+
+    $orphans = array();
+    $api_lookup = array_flip(array_map('strval', $api_ids));
+    foreach ($shown as $post_id) {
+        $upl_id = (string) get_post_meta($post_id, '_uplisting_id', true);
+        if ('' === $upl_id || !isset($api_lookup[$upl_id])) {
+            $orphans[] = array('post_id' => (int) $post_id, 'uplisting_id' => $upl_id, 'title' => get_the_title($post_id));
+        }
+    }
+
+    wp_send_json(array(
+        'accounts'                  => count($keys),
+        'properties_from_api'       => count(array_unique($api_ids)),
+        'live_by_current_rule'      => count(array_unique($live_ids)),
+        'shown_on_site_now'         => count($shown),
+        'shown_but_absent_from_api' => $orphans,
+        'sync_paused'               => get_option('rl_sync_paused', '1'),
+        'last_sync'                 => get_option('uplisting_last_sync_time') ? gmdate('c', (int) get_option('uplisting_last_sync_time')) : null,
+        'properties'                => $rows,
+    ));
+});
 
 add_action('rl_sync_continue', function () {
     if (get_option('rl_sync_cursor', false) === false) { return; }

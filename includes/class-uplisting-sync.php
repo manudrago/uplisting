@@ -39,7 +39,88 @@ class Uplisting_Sync {
             catch (\Throwable $e) { error_log('Uplisting batch import failed: ' . $e->getMessage()); }
             usleep(500000);
         }
-        return array('total' => $total, 'next_offset' => $end, 'processed' => $processed, 'done' => ($end >= $total));
+        $ids = array();
+        foreach ($data as $row) { if (!empty($row['id'])) $ids[] = (string) $row['id']; }
+
+        return array('total' => $total, 'next_offset' => $end, 'processed' => $processed, 'done' => ($end >= $total), 'ids' => $ids);
+    }
+
+    /** Values of the Uplisting status attribute that mean "not live". */
+    const INACTIVE_STATUSES = array('disabled', 'inactive', 'paused', 'archived', 'deleted', 'unlisted', 'draft');
+
+    /**
+     * @param string $status Lower-cased Uplisting status.
+     * @return bool
+     */
+    public static function is_enabled($status) {
+        return !in_array($status, self::INACTIVE_STATUSES, true);
+    }
+
+    /**
+     * The single place that decides whether a property is live. Filterable so the rule can be
+     * tuned against the real property count without touching the importer.
+     *
+     * @param string $status     Lower-cased Uplisting status.
+     * @param string $upl_domain Direct booking domain from the API.
+     * @param string $upl_slug   Property slug from the API.
+     * @return bool
+     */
+    public static function should_publish($status, $upl_domain, $upl_slug) {
+        $publish = self::is_enabled($status);
+
+        // Default rule also requires the property to be published to a direct booking domain,
+        // which is what puts it on *.bookeddirectly.host. If that turns out to exclude properties
+        // that are live there, switch the rule with:
+        //     wp option update rl_publish_rule status_only
+        if ('status_only' !== get_option('rl_publish_rule', 'status_and_site')) {
+            $publish = $publish && '' !== trim((string) $upl_domain) && '' !== trim((string) $upl_slug);
+        }
+
+        return (bool) apply_filters('rl_property_should_publish', $publish, $status, $upl_domain, $upl_slug);
+    }
+
+    /**
+     * Every property id the current key returns, and the subset that should be live. Used by the
+     * reconciliation pass and by the audit screen.
+     *
+     * @return array{all: string[], live: string[], rows: array[]}
+     */
+    public function inventory() {
+        $properties = $this->client->get_properties_all();
+        $data = (isset($properties['data']) && is_array($properties['data'])) ? $properties['data'] : array();
+
+        $all = array();
+        $live = array();
+        $rows = array();
+
+        foreach ($data as $property) {
+            $id = (string) ($property['id'] ?? '');
+            if ('' === $id) continue;
+
+            $attrs = $property['attributes'] ?? array();
+
+            $status_raw = $attrs['status'] ?? (isset($attrs['enabled']) ? ($attrs['enabled'] ? 'enabled' : 'disabled') : 'enabled');
+            if (is_bool($status_raw)) { $status_raw = $status_raw ? 'enabled' : 'disabled'; }
+            $status = strtolower(trim((string) $status_raw));
+
+            $domain = (string) ($attrs['uplisting_domain'] ?? '');
+            $slug   = (string) ($attrs['property_slug'] ?? '');
+            $should = self::should_publish($status, $domain, $slug);
+
+            $all[] = $id;
+            if ($should) $live[] = $id;
+
+            $rows[] = array(
+                'id'               => $id,
+                'name'             => (string) ($attrs['name'] ?? ''),
+                'status'           => $status,
+                'uplisting_domain' => $domain,
+                'property_slug'    => $slug,
+                'should_publish'   => $should,
+            );
+        }
+
+        return array('all' => $all, 'live' => $live, 'rows' => $rows);
     }
 
     private function import_property($property, $included) {
@@ -60,7 +141,8 @@ class Uplisting_Sync {
         $upl_slug     = sanitize_text_field($attrs['property_slug'] ?? '');
 
         $status_raw   = $attrs['status'] ?? (isset($attrs['enabled']) ? ($attrs['enabled'] ? 'enabled' : 'disabled') : 'enabled');
-        $status       = strtolower($status_raw);
+        if (is_bool($status_raw)) { $status_raw = $status_raw ? 'enabled' : 'disabled'; }
+        $status       = strtolower(trim((string) $status_raw));
 
         // Address
         if (!empty($rels['address']['data']['id'])) {
@@ -87,11 +169,11 @@ class Uplisting_Sync {
         ]);
         $post_id = !empty($existing) ? intval($existing[0]) : 0;
 
-        // FETCH CALENDAR DATA FIRST to determine post status
-        $has_availability = $this->check_availability_next_4_months($uplisting_id);
-        
-        // Determine post status: draft if no availability, publish if available
-        $post_status = $has_availability ? 'publish' : 'draft';
+        // Mirror the Uplisting direct booking site (*.bookeddirectly.host): a property is live
+        // there when it is enabled on the account and published to a booking domain. Calendar
+        // availability is deliberately NOT part of this test — a fully booked property still
+        // appears on the direct booking site, so it must stay published here too.
+        $post_status = self::should_publish($status, $upl_domain, $upl_slug) ? 'publish' : 'draft';
 
         $post_data = [
             'post_title'   => $title,
@@ -117,8 +199,12 @@ class Uplisting_Sync {
             update_post_meta($post_id, '_uplisting_account_key', md5($this->current_api_key));
         }
 
-        // Basic meta
-        update_post_meta($post_id, '_rental_status', $status);
+        // Basic meta. _rental_status is normalised to exactly Enabled/Disabled because the
+        // listing and map queries compare against 'Enabled'; the untouched API value is kept
+        // alongside it for debugging.
+        update_post_meta($post_id, '_rental_status', self::is_enabled($status) ? 'Enabled' : 'Disabled');
+        update_post_meta($post_id, '_rental_status_raw', $status);
+        update_post_meta($post_id, '_rental_on_booking_site', ($upl_domain && $upl_slug) ? 1 : 0);
         update_post_meta($post_id, '_rental_city', $city);
         update_post_meta($post_id, '_rental_address', $address);
         update_post_meta($post_id, '_rental_lat', $lat);
