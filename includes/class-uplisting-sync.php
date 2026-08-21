@@ -5,6 +5,7 @@ require_once ABSPATH . 'wp-admin/includes/file.php';
 class Uplisting_Sync {
     private $client;
     private $current_api_key;
+    private $live_ids_cache = false;
 
     public function __construct($client, $api_key = null) {
         $this->client = $client;
@@ -45,6 +46,49 @@ class Uplisting_Sync {
         return array('total' => $total, 'next_offset' => $end, 'processed' => $processed, 'done' => ($end >= $total), 'ids' => $ids);
     }
 
+    /**
+     * The property ids GET /availability returns with no search criteria.
+     *
+     * Per the Uplisting docs that endpoint answers with "a list of properties that meet the search
+     * criteria", and every criterion is optional — so with none supplied it is the account's
+     * sellable set, which is exactly what the direct booking site lists. GET /properties, by
+     * contrast, returns the whole account and carries no visibility field at all.
+     *
+     * Returns null when the answer cannot be trusted (API error, or an empty list), so an outage
+     * can never be read as "nothing is live".
+     *
+     * @return string[]|null
+     */
+    public function live_ids() {
+        if (false !== $this->live_ids_cache) return $this->live_ids_cache;
+
+        $transient = 'rl_live_ids_' . md5((string) $this->current_api_key);
+        $cached = get_transient($transient);
+        if (is_array($cached) && $cached) {
+            $this->live_ids_cache = $cached;
+            return $cached;
+        }
+
+        $resp = $this->client->get_availability();
+        if (!is_array($resp) || isset($resp['error']) || empty($resp['data']) || !is_array($resp['data'])) {
+            $this->live_ids_cache = null;
+            return null;
+        }
+
+        $ids = array();
+        foreach ($resp['data'] as $prop) {
+            if (!empty($prop['id'])) $ids[] = (string) $prop['id'];
+        }
+        $ids = array_values(array_unique($ids));
+
+        if (empty($ids)) { $this->live_ids_cache = null; return null; }
+
+        // Short cache so the cursor-based sync does not refetch on every tick.
+        set_transient($transient, $ids, 10 * MINUTE_IN_SECONDS);
+        $this->live_ids_cache = $ids;
+        return $ids;
+    }
+
     /** Values of the Uplisting status attribute that mean "not live". */
     const INACTIVE_STATUSES = array('disabled', 'inactive', 'paused', 'archived', 'deleted', 'unlisted', 'draft');
 
@@ -68,15 +112,16 @@ class Uplisting_Sync {
     /**
      * Which rule decides visibility. Set with: wp option update rl_publish_rule <value>
      *
+     *   availability_endpoint    returned by GET /availability, unfiltered       (default)
      *   status_only              enabled on the Uplisting account
-     *   status_and_site          + published to a direct booking domain          (default)
+     *   status_and_site          + published to a direct booking domain
      *   status_site_availability + at least one bookable day in the window
      */
     public static function publish_rule() {
-        $rule = (string) get_option('rl_publish_rule', 'status_and_site');
-        return in_array($rule, array('status_only', 'status_and_site', 'status_site_availability'), true)
+        $rule = (string) get_option('rl_publish_rule', 'availability_endpoint');
+        return in_array($rule, array('availability_endpoint', 'status_only', 'status_and_site', 'status_site_availability'), true)
             ? $rule
-            : 'status_and_site';
+            : 'availability_endpoint';
     }
 
     /** Months of calendar the availability arm of the rule looks at. */
@@ -85,28 +130,35 @@ class Uplisting_Sync {
     }
 
     /**
-     * @param string   $status     Lower-cased Uplisting status.
-     * @param string   $upl_domain Direct booking domain from the API.
-     * @param string   $upl_slug   Property slug from the API.
-     * @param bool|null $has_availability Null when unknown (calendar unreadable).
+     * @param array $signals status, domain, slug, has_availability (bool|null), in_live_set (bool|null).
      * @return bool|null True publish, false draft, null undecidable — leave the post alone.
      */
-    public static function should_publish($status, $upl_domain, $upl_slug, $has_availability = null) {
-        $rule = self::publish_rule();
+    public static function should_publish(array $signals) {
+        $rule   = self::publish_rule();
+        $status = (string) ($signals['status'] ?? 'enabled');
+        $domain = (string) ($signals['domain'] ?? '');
+        $slug   = (string) ($signals['slug'] ?? '');
+
+        if ('availability_endpoint' === $rule) {
+            $in_live_set = $signals['in_live_set'] ?? null;
+            // Unreadable live set means undecidable, never "draft everything".
+            $publish = (null === $in_live_set) ? null : (bool) $in_live_set;
+            return apply_filters('rl_property_should_publish', $publish, $status, $domain, $slug);
+        }
 
         $publish = self::is_enabled($status);
 
         if ('status_only' !== $rule) {
-            $publish = $publish && '' !== trim((string) $upl_domain) && '' !== trim((string) $upl_slug);
+            $publish = $publish && '' !== trim($domain) && '' !== trim($slug);
         }
 
         if ('status_site_availability' === $rule && $publish) {
-            // Unknown availability must never demote a live property.
-            if (null === $has_availability) return apply_filters('rl_property_should_publish', null, $status, $upl_domain, $upl_slug);
+            $has_availability = $signals['has_availability'] ?? null;
+            if (null === $has_availability) return apply_filters('rl_property_should_publish', null, $status, $domain, $slug);
             $publish = (bool) $has_availability;
         }
 
-        return apply_filters('rl_property_should_publish', (bool) $publish, $status, $upl_domain, $upl_slug);
+        return apply_filters('rl_property_should_publish', (bool) $publish, $status, $domain, $slug);
     }
 
     /**
@@ -122,6 +174,7 @@ class Uplisting_Sync {
         $all = array();
         $live = array();
         $rows = array();
+        $live_ids = $this->live_ids();
 
         foreach ($data as $property) {
             $id = (string) ($property['id'] ?? '');
@@ -155,7 +208,16 @@ class Uplisting_Sync {
                 usleep(250000); // 4 req/sec, inside Uplisting's 5/sec and 100/min limits.
             }
 
-            $should = self::should_publish($status, $domain, $slug, isset($row['days_available']) && null !== $row['days_available'] ? ($row['days_available'] > 0) : null);
+            $row['in_live_set'] = (null === $live_ids) ? null : in_array($id, $live_ids, true);
+            $row['rule_availability_endpoint'] = (true === $row['in_live_set']);
+
+            $should = self::should_publish(array(
+                'status'           => $status,
+                'domain'           => $domain,
+                'slug'             => $slug,
+                'has_availability' => (isset($row['days_available']) && null !== $row['days_available']) ? ($row['days_available'] > 0) : null,
+                'in_live_set'      => $row['in_live_set'],
+            ));
             $row['should_publish'] = $should;
 
             $all[] = $id;
@@ -214,14 +276,28 @@ class Uplisting_Sync {
         $post_id = !empty($existing) ? intval($existing[0]) : 0;
 
         // Mirror the Uplisting direct booking site (*.bookeddirectly.host). Which test does that is
-        // set by the rl_publish_rule option; only the availability arm needs a calendar call.
+        // set by the rl_publish_rule option; each arm fetches only what it needs.
+        $rule = self::publish_rule();
+
         $has_availability = null;
-        if ('status_site_availability' === self::publish_rule()) {
+        if ('status_site_availability' === $rule) {
             $window = $this->availability_window($uplisting_id, self::availability_months());
             $has_availability = (null === $window) ? null : ($window['days_available'] > 0);
         }
 
-        $decision = self::should_publish($status, $upl_domain, $upl_slug, $has_availability);
+        $in_live_set = null;
+        if ('availability_endpoint' === $rule) {
+            $live = $this->live_ids();
+            $in_live_set = (null === $live) ? null : in_array((string) $uplisting_id, $live, true);
+        }
+
+        $decision = self::should_publish(array(
+            'status'           => $status,
+            'domain'           => $upl_domain,
+            'slug'             => $upl_slug,
+            'has_availability' => $has_availability,
+            'in_live_set'      => $in_live_set,
+        ));
 
         // Undecidable (calendar unreadable) leaves an existing post exactly as it is; a brand new
         // one is parked as a draft rather than guessed into publication.
@@ -258,7 +334,9 @@ class Uplisting_Sync {
         // Basic meta. _rental_status is normalised to exactly Enabled/Disabled because the
         // listing and map queries compare against 'Enabled'; the untouched API value is kept
         // alongside it for debugging.
-        update_post_meta($post_id, '_rental_status', self::is_enabled($status) ? 'Enabled' : 'Disabled');
+        if (null !== $decision) {
+            update_post_meta($post_id, '_rental_status', $decision ? 'Enabled' : 'Disabled');
+        }
         update_post_meta($post_id, '_rental_status_raw', $status);
         update_post_meta($post_id, '_rental_on_booking_site', ($upl_domain && $upl_slug) ? 1 : 0);
         update_post_meta($post_id, '_rental_city', $city);

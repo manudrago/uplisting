@@ -909,6 +909,7 @@ add_action('admin_init', function () {
     $rows = array();
     $api_ids = array();
     $live_ids = array();
+    $availability_ids = array();
 
     foreach ($keys as $i => $key) {
         $client = new Uplisting_Client(array($key));
@@ -917,6 +918,8 @@ add_action('admin_init', function () {
 
         $api_ids  = array_merge($api_ids, $inv['all']);
         $live_ids = array_merge($live_ids, $inv['live']);
+        $from_availability = $sync->live_ids();
+        if (is_array($from_availability)) $availability_ids = array_merge($availability_ids, $from_availability);
 
         foreach ($inv['rows'] as $row) {
             $row['account'] = $i + 1;
@@ -955,22 +958,11 @@ add_action('admin_init', function () {
         }
     }
 
-    // The direct booking site is fundamentally a search over availability, so the unfiltered
-    // /availability endpoint may already return exactly the listed set — a far simpler answer
-    // than any attribute. One call per account, so it is cheap enough to always measure.
-    $availability_ids = array();
-    foreach ($keys as $key) {
-        $client = new Uplisting_Client(array($key));
-        $resp = $client->get_availability();
-        foreach (($resp['data'] ?? array()) as $prop) {
-            if (!empty($prop['id'])) $availability_ids[] = (string) $prop['id'];
-        }
-    }
     $availability_ids = array_values(array_unique($availability_ids));
 
     // How many properties each candidate rule would show, so the one matching the direct booking
     // sites can be picked on evidence instead of guessed.
-    $counts = array('status_only' => 0, 'status_and_site' => 0, 'availability_endpoint' => count($availability_ids));
+    $counts = array('availability_endpoint' => count($availability_ids), 'status_only' => 0, 'status_and_site' => 0);
     if ($with_cal) { $counts['status_site_availability'] = 0; $counts['calendar_unreadable'] = 0; }
     $availability_lookup = array_flip($availability_ids);
     foreach ($rows as $i => $row) {
