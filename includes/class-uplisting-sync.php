@@ -65,18 +65,48 @@ class Uplisting_Sync {
      * @param string $upl_slug   Property slug from the API.
      * @return bool
      */
-    public static function should_publish($status, $upl_domain, $upl_slug) {
+    /**
+     * Which rule decides visibility. Set with: wp option update rl_publish_rule <value>
+     *
+     *   status_only              enabled on the Uplisting account
+     *   status_and_site          + published to a direct booking domain          (default)
+     *   status_site_availability + at least one bookable day in the window
+     */
+    public static function publish_rule() {
+        $rule = (string) get_option('rl_publish_rule', 'status_and_site');
+        return in_array($rule, array('status_only', 'status_and_site', 'status_site_availability'), true)
+            ? $rule
+            : 'status_and_site';
+    }
+
+    /** Months of calendar the availability arm of the rule looks at. */
+    public static function availability_months() {
+        return max(1, (int) get_option('rl_availability_months', 4));
+    }
+
+    /**
+     * @param string   $status     Lower-cased Uplisting status.
+     * @param string   $upl_domain Direct booking domain from the API.
+     * @param string   $upl_slug   Property slug from the API.
+     * @param bool|null $has_availability Null when unknown (calendar unreadable).
+     * @return bool|null True publish, false draft, null undecidable — leave the post alone.
+     */
+    public static function should_publish($status, $upl_domain, $upl_slug, $has_availability = null) {
+        $rule = self::publish_rule();
+
         $publish = self::is_enabled($status);
 
-        // Default rule also requires the property to be published to a direct booking domain,
-        // which is what puts it on *.bookeddirectly.host. If that turns out to exclude properties
-        // that are live there, switch the rule with:
-        //     wp option update rl_publish_rule status_only
-        if ('status_only' !== get_option('rl_publish_rule', 'status_and_site')) {
+        if ('status_only' !== $rule) {
             $publish = $publish && '' !== trim((string) $upl_domain) && '' !== trim((string) $upl_slug);
         }
 
-        return (bool) apply_filters('rl_property_should_publish', $publish, $status, $upl_domain, $upl_slug);
+        if ('status_site_availability' === $rule && $publish) {
+            // Unknown availability must never demote a live property.
+            if (null === $has_availability) return apply_filters('rl_property_should_publish', null, $status, $upl_domain, $upl_slug);
+            $publish = (bool) $has_availability;
+        }
+
+        return apply_filters('rl_property_should_publish', (bool) $publish, $status, $upl_domain, $upl_slug);
     }
 
     /**
@@ -85,7 +115,7 @@ class Uplisting_Sync {
      *
      * @return array{all: string[], live: string[], rows: array[]}
      */
-    public function inventory() {
+    public function inventory($with_availability = false, $months = 4) {
         $properties = $this->client->get_properties_all();
         $data = (isset($properties['data']) && is_array($properties['data'])) ? $properties['data'] : array();
 
@@ -105,19 +135,33 @@ class Uplisting_Sync {
 
             $domain = (string) ($attrs['uplisting_domain'] ?? '');
             $slug   = (string) ($attrs['property_slug'] ?? '');
-            $should = self::should_publish($status, $domain, $slug);
 
-            $all[] = $id;
-            if ($should) $live[] = $id;
-
-            $rows[] = array(
+            $row = array(
                 'id'               => $id,
                 'name'             => (string) ($attrs['name'] ?? ''),
                 'status'           => $status,
                 'uplisting_domain' => $domain,
                 'property_slug'    => $slug,
-                'should_publish'   => $should,
+                'rule_status_only' => self::is_enabled($status),
+                'rule_status_site' => self::is_enabled($status) && '' !== trim($domain) && '' !== trim($slug),
             );
+
+            if ($with_availability) {
+                $window = $this->availability_window($id, $months);
+                $row['calendar_readable'] = (null !== $window);
+                $row['days_total']        = $window ? $window['days_total'] : null;
+                $row['days_available']    = $window ? $window['days_available'] : null;
+                $row['rule_status_site_availability'] = $row['rule_status_site'] && $window && $window['days_available'] > 0;
+                usleep(250000); // 4 req/sec, inside Uplisting's 5/sec and 100/min limits.
+            }
+
+            $should = self::should_publish($status, $domain, $slug, isset($row['days_available']) && null !== $row['days_available'] ? ($row['days_available'] > 0) : null);
+            $row['should_publish'] = $should;
+
+            $all[] = $id;
+            if (true === $should) $live[] = $id;
+
+            $rows[] = $row;
         }
 
         return array('all' => $all, 'live' => $live, 'rows' => $rows);
@@ -169,11 +213,23 @@ class Uplisting_Sync {
         ]);
         $post_id = !empty($existing) ? intval($existing[0]) : 0;
 
-        // Mirror the Uplisting direct booking site (*.bookeddirectly.host): a property is live
-        // there when it is enabled on the account and published to a booking domain. Calendar
-        // availability is deliberately NOT part of this test — a fully booked property still
-        // appears on the direct booking site, so it must stay published here too.
-        $post_status = self::should_publish($status, $upl_domain, $upl_slug) ? 'publish' : 'draft';
+        // Mirror the Uplisting direct booking site (*.bookeddirectly.host). Which test does that is
+        // set by the rl_publish_rule option; only the availability arm needs a calendar call.
+        $has_availability = null;
+        if ('status_site_availability' === self::publish_rule()) {
+            $window = $this->availability_window($uplisting_id, self::availability_months());
+            $has_availability = (null === $window) ? null : ($window['days_available'] > 0);
+        }
+
+        $decision = self::should_publish($status, $upl_domain, $upl_slug, $has_availability);
+
+        // Undecidable (calendar unreadable) leaves an existing post exactly as it is; a brand new
+        // one is parked as a draft rather than guessed into publication.
+        if (null === $decision) {
+            $post_status = $post_id ? get_post_status($post_id) : 'draft';
+        } else {
+            $post_status = $decision ? 'publish' : 'draft';
+        }
 
         $post_data = [
             'post_title'   => $title,
@@ -349,13 +405,22 @@ class Uplisting_Sync {
     }
 
     /**
-     * Check if property has any availability in the next 4 months
+     * Bookable days in the next N months.
+     *
+     * Returns null when the calendar could not be read at all — an API error, an empty envelope,
+     * a missing key. The old code returned false in that case, which was indistinguishable from a
+     * genuinely full calendar and silently drafted live properties whenever Uplisting hiccuped.
+     *
+     * @param int|string $uplisting_id
+     * @param int        $months
+     * @return array{days_total:int, days_available:int}|null
      */
-    private function check_availability_next_4_months($uplisting_id) {
-        if (!$this->current_api_key || !$uplisting_id) return false;
+    public function availability_window($uplisting_id, $months = 4) {
+        if (!$this->current_api_key || !$uplisting_id) return null;
 
+        $months = max(1, (int) $months);
         $from = date('Y-m-d');
-        $to = date('Y-m-d', strtotime('+4 months'));
+        $to   = date('Y-m-d', strtotime('+' . $months . ' months'));
 
         $calendar_data = $this->client->get_calendar_for_key(
             $this->current_api_key,
@@ -364,18 +429,16 @@ class Uplisting_Sync {
             $to
         );
 
-        if (empty($calendar_data['calendar']['days'])) return false;
+        if (!is_array($calendar_data) || isset($calendar_data['error'])) return null;
+        if (!isset($calendar_data['calendar']['days']) || !is_array($calendar_data['calendar']['days'])) return null;
 
         $days = $calendar_data['calendar']['days'];
-        
-        // Check if ANY day in the next 4 months is available
+        $available = 0;
         foreach ($days as $day) {
-            if (!empty($day['available']) && isset($day['day_rate'])) {
-                return true; // Found at least one available day
-            }
+            if (!empty($day['available']) && isset($day['day_rate'])) $available++;
         }
 
-        return false; // No available days found
+        return array('days_total' => count($days), 'days_available' => $available);
     }
 
     /**

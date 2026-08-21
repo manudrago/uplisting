@@ -854,6 +854,11 @@ add_action('admin_init', function () {
     $keys = array_values(array_filter(array_map('trim', (array) get_option('uplisting_api_keys', array()))));
     if (empty($keys)) { wp_send_json(array('error' => 'no api keys configured')); }
 
+    // ?cal=1 also reads each property's calendar, so the availability-based rule can be counted.
+    // That is one extra API call per property, throttled — expect ~10s for 35 properties.
+    $with_cal = !empty($_GET['cal']);
+    $months   = isset($_GET['months']) ? max(1, intval($_GET['months'])) : Uplisting_Sync::availability_months();
+
     $rows = array();
     $api_ids = array();
     $live_ids = array();
@@ -861,7 +866,7 @@ add_action('admin_init', function () {
     foreach ($keys as $i => $key) {
         $client = new Uplisting_Client(array($key));
         $sync   = new Uplisting_Sync($client, $key);
-        $inv    = $sync->inventory();
+        $inv    = $sync->inventory($with_cal, $months);
 
         $api_ids  = array_merge($api_ids, $inv['all']);
         $live_ids = array_merge($live_ids, $inv['live']);
@@ -903,9 +908,25 @@ add_action('admin_init', function () {
         }
     }
 
+    // How many properties each candidate rule would show, so the one matching the direct booking
+    // sites can be picked on evidence instead of guessed.
+    $counts = array('status_only' => 0, 'status_and_site' => 0);
+    if ($with_cal) { $counts['status_site_availability'] = 0; $counts['calendar_unreadable'] = 0; }
+    foreach ($rows as $row) {
+        if (!empty($row['rule_status_only'])) $counts['status_only']++;
+        if (!empty($row['rule_status_site'])) $counts['status_and_site']++;
+        if ($with_cal) {
+            if (!empty($row['rule_status_site_availability'])) $counts['status_site_availability']++;
+            if (empty($row['calendar_readable'])) $counts['calendar_unreadable']++;
+        }
+    }
+
     wp_send_json(array(
         'accounts'                  => count($keys),
         'properties_from_api'       => count(array_unique($api_ids)),
+        'active_rule'               => Uplisting_Sync::publish_rule(),
+        'availability_months'       => $months,
+        'counts_by_rule'            => $counts,
         'live_by_current_rule'      => count(array_unique($live_ids)),
         'shown_on_site_now'         => count($shown),
         'shown_but_absent_from_api' => $orphans,
