@@ -1025,8 +1025,51 @@ add_action('admin_init', function () {
     if (empty($_GET['rl_sync_run'])) { return; }
     if (!current_user_can('manage_options')) { return; }
     @set_time_limit(0); @ini_set('memory_limit', '256M');
-    if (!empty($_GET['reset'])) { update_option('rl_sync_cursor', array('k' => 0, 'o' => 0)); }
+    if (!empty($_GET['reset'])) {
+        update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
+        // A restarted pass must not inherit ids seen in the abandoned one, or reconciliation
+        // would spare properties the API no longer returns.
+        delete_option('rl_sync_seen_ids');
+    }
     $n = isset($_GET['n']) ? max(1, intval($_GET['n'])) : 2;
     $dry = !empty($_GET['dry']);
-    wp_send_json(rl_sync_tick($n, $dry));
+
+    // ?all=1 keeps ticking until the pass finishes or the time budget runs out, instead of
+    // making someone reload the URL once per couple of properties.
+    if (!empty($_GET['all']) && !$dry) {
+        $budget  = isset($_GET['seconds']) ? min(300, max(10, intval($_GET['seconds']))) : 45;
+        $started = time();
+        $ticks   = 0;
+        $res     = array();
+
+        do {
+            $res = rl_sync_tick($n);
+            $ticks++;
+            if (!empty($res['error'])) break;
+        } while (empty($res['all_done']) && (time() - $started) < $budget);
+
+        $res['ticks']   = $ticks;
+        $res['seconds'] = time() - $started;
+        if (empty($res['all_done'])) {
+            rl_schedule_continue();
+            $res['resume'] = 'not finished — reload this URL, or let the scheduled rl_sync_continue carry on';
+        }
+        wp_send_json($res);
+    }
+
+    $res = rl_sync_tick($n, $dry);
+    if (!$dry && empty($res['all_done'])) rl_schedule_continue();
+    wp_send_json($res);
 });
+
+/**
+ * Queue the next chunk of an unfinished pass. The manual runner never did this, so a pass started
+ * by hand only advanced while someone kept reloading.
+ *
+ * @return void
+ */
+function rl_schedule_continue() {
+    if (get_option('rl_sync_cursor', false) !== false && !wp_next_scheduled('rl_sync_continue')) {
+        wp_schedule_single_event(time() + 60, 'rl_sync_continue');
+    }
+}
