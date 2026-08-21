@@ -839,6 +839,53 @@ function rl_reconcile_missing($seen_ids) {
 }
 
 /**
+ * Raw attribute dump for a handful of properties, so two that Uplisting treats differently can be
+ * diffed attribute by attribute. Administrators only.
+ *
+ *   /wp-admin/?rl_raw=1&ids=88898,88900,88901,88902
+ */
+add_action('admin_init', function () {
+    if (empty($_GET['rl_raw'])) { return; }
+    if (!current_user_can('manage_options')) { return; }
+    if (!class_exists('Uplisting_Client')) { wp_send_json(array('error' => 'classes not loaded')); }
+
+    $wanted = array_values(array_filter(array_map('trim', explode(',', (string) ($_GET['ids'] ?? '')))));
+    if (empty($wanted)) { wp_send_json(array('error' => 'pass ids=1,2,3')); }
+    $wanted = array_flip($wanted);
+
+    @set_time_limit(0);
+
+    $keys = array_values(array_filter(array_map('trim', (array) get_option('uplisting_api_keys', array()))));
+    $out  = array();
+    $all_keys_seen = array();
+
+    foreach ($keys as $i => $key) {
+        $client = new Uplisting_Client(array($key));
+        $resp   = $client->get_properties_all();
+        foreach (($resp['data'] ?? array()) as $property) {
+            $id = (string) ($property['id'] ?? '');
+            if ('' === $id || !isset($wanted[$id])) continue;
+
+            $attrs = $property['attributes'] ?? array();
+            foreach (array_keys($attrs) as $attr_key) { $all_keys_seen[$attr_key] = true; }
+
+            $out[$id] = array(
+                'account'       => $i + 1,
+                'attributes'    => $attrs,
+                'relationships' => array_keys($property['relationships'] ?? array()),
+            );
+        }
+    }
+
+    wp_send_json(array(
+        'requested'      => array_keys($wanted),
+        'found'          => array_keys($out),
+        'attribute_keys' => array_keys($all_keys_seen),
+        'properties'     => $out,
+    ));
+});
+
+/**
  * Audit screen: what the API returns, what would be live, and what WordPress currently shows.
  * Administrators only.
  *
