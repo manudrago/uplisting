@@ -250,6 +250,20 @@ jQuery(function ($) {
         return window.rentalAllProperties || [];
     }
 
+    // Marker numbers are fixed per property, assigned once from the full unfiltered set at page
+    // load. A filtered map then keeps each pin's original number, so pins and cards always agree —
+    // renumbering the visible subset would leave the two out of step.
+    //
+    // Captured now, before any search: an AJAX response carries its own (filtered)
+    // window.rentalAllProperties, and jQuery evaluates that script while parsing, so the global is
+    // not a safe baseline later on.
+    const numberById = {};
+    (function assignStableNumbers() {
+        readMapProps($(document)).forEach(function (p, i) {
+            numberById[String(p.id)] = i + 1;
+        });
+    })();
+
     // --- Leaflet map: shows the properties matching the current search, with image popups ---
     function rebuildMap(propsOverride) {
         if (typeof L === 'undefined' || !$('#rental-map').length) return;
@@ -268,16 +282,18 @@ jQuery(function ($) {
         const props = propsOverride || window.rentalAllProperties || [];
         const markers = [];
         const markersById = {};
-        let markerIndex = 1;
+        let fallbackNumber = Object.keys(numberById).length + 1;
 
         props.forEach(function (p) {
             const lat = parseFloat(p.lat);
             const lng = parseFloat(p.lng);
             if (!lat || !lng) return;
 
+            const num = numberById[String(p.id)] || fallbackNumber++;
+
             const numberIcon = L.divIcon({
                 className: 'custom-marker',
-                html: '<div class="marker-pin" data-id="' + p.id + '"><span class="marker-number">' + markerIndex + '</span></div>',
+                html: '<div class="marker-pin" data-id="' + p.id + '"><span class="marker-number">' + num + '</span></div>',
                 iconSize: [40, 40],
                 iconAnchor: [20, 40],
                 popupAnchor: [0, -40]
@@ -300,9 +316,8 @@ jQuery(function ($) {
                 $('.rental-card[data-id="' + p.id + '"]').removeClass('highlighted');
             });
 
-            markersById[String(p.id)] = { marker: marker, num: markerIndex };
+            markersById[String(p.id)] = { marker: marker, num: num };
             markers.push(marker);
-            markerIndex++;
         });
 
         // Number badges on visible cards + card-hover -> marker highlight
