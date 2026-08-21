@@ -1030,6 +1030,11 @@ add_action('admin_init', function () {
         // A restarted pass must not inherit ids seen in the abandoned one, or reconciliation
         // would spare properties the API no longer returns.
         delete_option('rl_sync_seen_ids');
+        // Start from fresh API snapshots too.
+        foreach ((array) get_option('uplisting_api_keys', array()) as $k) {
+            delete_transient('rl_props_' . md5(trim($k)));
+            delete_transient('rl_live_ids_' . md5(trim($k)));
+        }
     }
     $n = isset($_GET['n']) ? max(1, intval($_GET['n'])) : 2;
     $dry = !empty($_GET['dry']);

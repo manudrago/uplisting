@@ -15,7 +15,7 @@ class Uplisting_Sync {
     public function sync_all_properties() {
         error_log('Fetching properties for API key: ' . substr($this->current_api_key ?? 'N/A', 0, 6));
         
-        $properties = $this->client->get_properties_all();
+        $properties = $this->properties_payload();
         if (empty($properties['data'])) return;
 
         foreach ($properties['data'] as $property) {
@@ -28,7 +28,7 @@ class Uplisting_Sync {
     }
 
     public function sync_batch($offset = 0, $limit = 2, $dry = false) {
-        $properties = $this->client->get_properties_all();
+        $properties = $this->properties_payload();
         $data = (isset($properties['data']) && is_array($properties['data'])) ? $properties['data'] : array();
         $included = isset($properties['included']) ? $properties['included'] : array();
         $total = count($data);
@@ -44,6 +44,28 @@ class Uplisting_Sync {
         foreach ($data as $row) { if (!empty($row['id'])) $ids[] = (string) $row['id']; }
 
         return array('total' => $total, 'next_offset' => $end, 'processed' => $processed, 'done' => ($end >= $total), 'ids' => $ids);
+    }
+
+    /**
+     * GET /properties for the current key, cached for the duration of a pass.
+     *
+     * The cursor-based sync calls this on every tick, and the payload is the whole account with
+     * photos, amenities, fees, taxes and policies inlined — refetching it once per two properties
+     * was most of each tick's wall time. Caching it also gives the pass a consistent snapshot,
+     * which is what reconciliation should be comparing against.
+     *
+     * @return array
+     */
+    private function properties_payload() {
+        $transient = 'rl_props_' . md5((string) $this->current_api_key);
+
+        $cached = get_transient($transient);
+        if (is_array($cached) && !empty($cached['data'])) return $cached;
+
+        $payload = $this->client->get_properties_all();
+        if (!empty($payload['data'])) set_transient($transient, $payload, 15 * MINUTE_IN_SECONDS);
+
+        return $payload;
     }
 
     /**
@@ -191,7 +213,7 @@ class Uplisting_Sync {
      * @return array{all: string[], live: string[], rows: array[]}
      */
     public function inventory($with_availability = false, $months = 4) {
-        $properties = $this->client->get_properties_all();
+        $properties = $this->properties_payload();
         $data = (isset($properties['data']) && is_array($properties['data'])) ? $properties['data'] : array();
 
         $all = array();
