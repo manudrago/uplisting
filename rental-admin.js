@@ -1,0 +1,1 @@
+// admin placeholder - gallery JS injected inline via PHP
