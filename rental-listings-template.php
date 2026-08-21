@@ -32,6 +32,10 @@ if (!isset($query) || !$query instanceof WP_Query) {
         'meta_query'     => $meta_query,
     ];
     $query = new WP_Query($args);
+
+    // The map is built from the same clauses. Unfiltered that is just the Enabled check, so it
+    // shows every property, as it always has.
+    $rl_map_meta = $meta_query;
 }
 ?>
 
@@ -182,18 +186,17 @@ if (!isset($query) || !$query instanceof WP_Query) {
 <?php
 // Map data: the properties matching the current search, across all pages.
 //
-// Take only the listing query's meta_query rather than cloning its query_vars. A query that has
-// already run carries nopaging => false, and WP_Query only derives nopaging from posts_per_page
-// when the var is absent — so a cloned set combined with posts_per_page => -1 builds
-// "LIMIT 0, -1", which MySQL rejects, and the map silently comes back empty.
+// $rl_map_meta is set by whoever built the listing query — this file on a direct page load, or
+// ajax_filter() on a search — and holds the clauses that query used. Reading them back off the
+// WP_Query instead did not work: get('meta_query') came back empty, the fallback took over, and
+// the map showed the whole portfolio while the grid showed four results.
 //
-// With no filters applied the meta_query is just the Enabled clause, so the map shows every
-// property exactly as it always did; the city, guest and availability clauses narrow it only once
-// the visitor searches.
-$map_meta = $query->get('meta_query');
-if (empty($map_meta)) {
-    $map_meta = [[ 'key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=' ]];
-}
+// Do not rebuild this from $query->query_vars either. A query that has already run carries
+// nopaging => false, WP_Query only infers nopaging from posts_per_page when the var is absent, and
+// the combination builds "LIMIT 0, -1" — which MySQL rejects, leaving the map blank.
+$map_meta = isset($rl_map_meta) && !empty($rl_map_meta)
+    ? $rl_map_meta
+    : [[ 'key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=' ]];
 
 $map_query = new WP_Query([
     'post_type'      => 'rental_property',

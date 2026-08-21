@@ -301,7 +301,10 @@ class Rental_Listings_Redirect {
             ];
         }
 
-        // Query and print same template (design unchanged)
+        // Query and print same template (design unchanged). The map is built from this same set of
+        // clauses — passed explicitly rather than read back off the WP_Query, which did not survive
+        // the round trip and left the map showing every property.
+        $rl_map_meta = $args['meta_query'];
         $query = new WP_Query($args);
         ob_start();
         include plugin_dir_path(__FILE__) . 'rental-listings-template.php';

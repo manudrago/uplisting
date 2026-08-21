@@ -246,6 +246,7 @@ jQuery(function ($) {
         } catch (e) {
             console.error('Could not read map data', e);
         }
+        console.warn('rental map: #rental-map-data missing, falling back to the full property set');
         return window.rentalAllProperties || [];
     }
 
