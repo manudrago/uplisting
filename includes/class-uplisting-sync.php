@@ -434,27 +434,36 @@ class Uplisting_Sync {
         }
         update_post_meta($post_id, '_rental_amenities', $amenities);
 
-        // Gallery
-        $gallery = [];
+        // Gallery. Collect the URLs first: if the photo set is unchanged since the last import,
+        // the whole pass — one attachment lookup and possibly one download per photo — is skipped.
+        // Re-running the sync on an already-imported account was spending most of its time here.
+        $photo_urls = array();
         if (!empty($rels['photos']['data'])) {
             foreach ($rels['photos']['data'] as $photo_ref) {
                 $photo_id = $photo_ref['id'] ?? null;
                 if (!$photo_id) continue;
-        
+
                 $photo_item = $this->find_included_item($included, 'photos', $photo_id);
                 $img_url = $photo_item['attributes']['url'] ?? '';
-        
-                if ($img_url) {
-                    $attachment_id = $this->import_image($img_url, $post_id);
-                    if ($attachment_id) {
-                        $gallery[] = $attachment_id;
-                    } else {
-                        $gallery[] = esc_url($img_url);
-                    }
-                }
+                if ($img_url) $photo_urls[] = $img_url;
             }
         }
-        update_post_meta($post_id, '_rental_gallery', $gallery);
+
+        $photo_hash    = md5(implode('|', $photo_urls));
+        $stored_hash   = (string) get_post_meta($post_id, '_rental_gallery_hash', true);
+        $stored_galery = get_post_meta($post_id, '_rental_gallery', true);
+
+        if ($photo_hash === $stored_hash && !empty($stored_galery) && is_array($stored_galery)) {
+            $gallery = $stored_galery;
+        } else {
+            $gallery = array();
+            foreach ($photo_urls as $img_url) {
+                $attachment_id = $this->import_image($img_url, $post_id);
+                $gallery[] = $attachment_id ? $attachment_id : esc_url($img_url);
+            }
+            update_post_meta($post_id, '_rental_gallery', $gallery);
+            update_post_meta($post_id, '_rental_gallery_hash', $photo_hash);
+        }
 
         // Featured image = FIRST image in the Uplisting gallery
         if (!empty($gallery) && is_numeric($gallery[0])) {
@@ -673,14 +682,16 @@ class Uplisting_Sync {
     }
 
     private function find_existing_attachment($url_clean) {
-        $q = new WP_Query([
-            'post_type'      => 'attachment',
-            'meta_key'       => '_source_url',
-            'meta_value'     => esc_url($url_clean),
-            'posts_per_page' => 1,
-            'fields'         => 'ids'
-        ]);
-        return !empty($q->posts) ? $q->posts[0] : false;
+        global $wpdb;
+
+        // A full WP_Query per photo — twenty-five of them per property — was the bulk of each
+        // property's import time. This is the same lookup as one indexed statement.
+        $id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_source_url' AND meta_value = %s LIMIT 1",
+            esc_url($url_clean)
+        ));
+
+        return $id ? (int) $id : false;
     }
     
     /**
