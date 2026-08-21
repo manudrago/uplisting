@@ -343,31 +343,133 @@ class Rental_Listings_Redirect {
             </form>
             <?php
             $cursor = get_option('rl_sync_cursor', false);
-            if (isset($_GET['synced'])) {
-                echo empty($_GET['done'])
-                    ? '<div class="notice notice-warning"><p>Sync in progress — press <strong>Continue sync</strong> again, or leave it to the background job.</p></div>'
-                    : '<div class="notice notice-success"><p>✅ Sync complete.</p></div>';
-            }
-            if ($cursor !== false) {
-                printf(
-                    '<div class="notice notice-info"><p>A pass is part-way through (account %d, property %d). <strong>Continue sync</strong> resumes it; <em>Restart</em> throws it away and begins again.</p></div>',
-                    (int) (isset($cursor['k']) ? $cursor['k'] : 0) + 1,
-                    (int) (isset($cursor['o']) ? $cursor['o'] : 0)
-                );
-            }
+            $last   = get_option('uplisting_last_sync_time');
             ?>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:inline-block">
-                <input type="hidden" name="action" value="uplisting_sync_now">
-                <?php submit_button($cursor !== false ? 'Continue sync' : 'Sync Now from Uplisting', 'primary', 'submit', false); ?>
-            </form>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:inline-block;margin-left:8px">
-                <input type="hidden" name="action" value="uplisting_sync_now">
-                <input type="hidden" name="restart" value="1">
-                <?php submit_button('Restart from scratch', 'secondary', 'submit', false); ?>
-            </form>
-            <p><em>Last completed sync: <?php echo esc_html(get_option('uplisting_last_sync_time') ? date('Y-m-d H:i:s', get_option('uplisting_last_sync_time')) : 'Never'); ?></em></p>
-            <p>🔄 Automatic sync runs every 3 hours. Each press works for about 40 seconds and then hands off to the background job, so a large account may need a few presses.</p>
+
+            <h2>Sync</h2>
+            <p>
+                <button type="button" class="button button-primary" id="rl-sync-start">Sync now</button>
+                <label style="margin-left:12px"><input type="checkbox" id="rl-sync-restart" <?php checked($cursor === false); ?>> start from scratch</label>
+            </p>
+            <?php if ($cursor !== false) : ?>
+                <p class="description">A pass is part-way through (account <?php echo (int) (isset($cursor['k']) ? $cursor['k'] : 0) + 1; ?>, property <?php echo (int) (isset($cursor['o']) ? $cursor['o'] : 0); ?>). Leave the box unticked to carry on from there.</p>
+            <?php endif; ?>
+
+            <div id="rl-sync-box" style="display:none;max-width:640px">
+                <div style="background:#e5e5e5;border-radius:3px;height:22px;overflow:hidden">
+                    <div id="rl-sync-bar" style="background:#2271b1;height:100%;width:0;transition:width .3s"></div>
+                </div>
+                <p id="rl-sync-msg" style="margin:8px 0 0"></p>
+                <pre id="rl-sync-report" style="display:none;white-space:pre-wrap;background:#fff;border:1px solid #ccd0d4;padding:10px;margin-top:10px"></pre>
+            </div>
+
+            <p><em>Last completed sync: <?php echo esc_html($last ? date('Y-m-d H:i:s', $last) : 'Never'); ?></em></p>
+            <p>🔄 Automatic sync runs every 3 hours. Pressing the button drives the whole pass from this page — keep the tab open until it says it has finished. If you close it, the background job picks up where it stopped.</p>
             <p><a href="<?php echo esc_url(admin_url('?rl_audit=1')); ?>">Open the audit</a> to compare what the API returns with what the site shows.</p>
+
+            <script>
+            (function () {
+                var startBtn = document.getElementById('rl-sync-start'),
+                    restart  = document.getElementById('rl-sync-restart'),
+                    box      = document.getElementById('rl-sync-box'),
+                    bar      = document.getElementById('rl-sync-bar'),
+                    msg      = document.getElementById('rl-sync-msg'),
+                    report   = document.getElementById('rl-sync-report'),
+                    nonce    = <?php echo wp_json_encode(wp_create_nonce('rl_sync_step')); ?>,
+                    ajaxurl  = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>,
+                    first    = true,
+                    stopped  = false;
+
+                function step() {
+                    if (stopped) return;
+
+                    var body = new URLSearchParams();
+                    body.append('action', 'rl_sync_step');
+                    body.append('nonce', nonce);
+                    if (first && restart.checked) body.append('restart', '1');
+                    first = false;
+
+                    fetch(ajaxurl, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString()
+                    })
+                    .then(function (r) { return r.json(); })
+                    .then(function (json) {
+                        if (!json || !json.success) {
+                            fail((json && json.data && json.data.message) || 'The server refused the request.');
+                            return;
+                        }
+
+                        var d = json.data;
+
+                        if (d.error) { fail(d.error); return; }
+
+                        var total = d.properties_for_key || 0,
+                            done  = d.offset || 0,
+                            pct   = total ? Math.round((done / total) * 100) : 0;
+
+                        bar.style.width = (d.all_done ? 100 : pct) + '%';
+                        msg.textContent = d.all_done
+                            ? 'Finished.'
+                            : 'Account ' + ((d.key_index || 0) + 1) + ' of ' + (d.key_count || 1) +
+                              ' — ' + done + ' of ' + total + ' properties';
+
+                        if (d.all_done) {
+                            startBtn.disabled = false;
+                            startBtn.textContent = 'Sync now';
+                            bar.style.background = '#00a32a';
+                            showReport(d);
+                            return;
+                        }
+
+                        step();
+                    })
+                    .catch(function (e) { fail(e.message || 'Network error.'); });
+                }
+
+                function showReport(d) {
+                    var lines = ['Sync complete.'];
+                    var r = d.reconciled;
+                    if (r && r.drafted && r.drafted.length) {
+                        lines.push('', 'Set to draft (no longer in the Uplisting API):');
+                        r.drafted.forEach(function (p) {
+                            lines.push('  #' + p.post_id + '  [' + p.uplisting_id + ']  ' + p.title);
+                        });
+                    } else if (r && r.skipped) {
+                        lines.push('', 'Reconciliation skipped: ' + r.skipped);
+                    } else {
+                        lines.push('', 'Nothing needed drafting.');
+                    }
+                    report.textContent = lines.join('\n');
+                    report.style.display = 'block';
+                }
+
+                function fail(text) {
+                    stopped = true;
+                    startBtn.disabled = false;
+                    startBtn.textContent = 'Resume sync';
+                    bar.style.background = '#d63638';
+                    msg.textContent = 'Stopped: ' + text + ' Press Resume to carry on — nothing is lost.';
+                }
+
+                startBtn.addEventListener('click', function () {
+                    stopped = false;
+                    startBtn.disabled = true;
+                    startBtn.textContent = 'Syncing…';
+                    box.style.display = 'block';
+                    report.style.display = 'none';
+                    bar.style.background = '#2271b1';
+                    msg.textContent = 'Starting…';
+                    step();
+                });
+
+                window.addEventListener('beforeunload', function (e) {
+                    if (startBtn.disabled) { e.preventDefault(); e.returnValue = ''; }
+                });
+            })();
+            </script>
         </div>
         <?php
     }
@@ -1084,6 +1186,12 @@ add_action('admin_init', function () {
 
 add_action('rl_sync_continue', function () {
     if (get_option('rl_sync_cursor', false) === false) { return; }
+    // Someone is driving the pass from the settings screen; two runners on one cursor would
+    // import the same properties twice and scramble the offset.
+    if (get_transient('rl_sync_lock')) {
+        if (!wp_next_scheduled('rl_sync_continue')) wp_schedule_single_event(time() + 120, 'rl_sync_continue');
+        return;
+    }
     @set_time_limit(0); @ini_set('memory_limit', '256M');
     rl_sync_tick(2);
     if (get_option('rl_sync_cursor', false) !== false && !wp_next_scheduled('rl_sync_continue')) {
@@ -1135,6 +1243,47 @@ add_action('admin_init', function () {
     $res = rl_sync_tick($n, $dry);
     if (!$dry && empty($res['all_done'])) rl_schedule_continue();
     wp_send_json($res);
+});
+
+/**
+ * One chunk of a pass, called repeatedly by the settings screen so a single press runs the whole
+ * sync. Each call works for about twenty seconds, which keeps it clear of PHP and proxy timeouts,
+ * then reports progress for the bar.
+ */
+add_action('wp_ajax_rl_sync_step', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(array('message' => 'Not allowed'), 403);
+    check_ajax_referer('rl_sync_step', 'nonce');
+
+    if (!function_exists('rl_sync_tick')) wp_send_json_error(array('message' => 'Sync not loaded'), 500);
+
+    @set_time_limit(0);
+    @ini_set('memory_limit', '256M');
+
+    if (!empty($_POST['restart'])) {
+        update_option('rl_sync_cursor', array('k' => 0, 'o' => 0));
+        delete_option('rl_sync_seen_ids');
+        foreach ((array) get_option('uplisting_api_keys', array()) as $k) {
+            delete_transient('rl_props_' . md5(trim($k)));
+            delete_transient('rl_live_ids_' . md5(trim($k)));
+        }
+    }
+
+    // Hold the lock for the duration so the background job does not process the same cursor.
+    set_transient('rl_sync_lock', 1, 120);
+
+    $started = time();
+    $res = array();
+    do {
+        $res = rl_sync_tick(5);
+        if (!empty($res['error'])) break;
+    } while (empty($res['all_done']) && (time() - $started) < 20);
+
+    delete_transient('rl_sync_lock');
+
+    // Only hand off to cron once the browser stops driving.
+    if (!empty($res['error'])) rl_schedule_continue();
+
+    wp_send_json_success($res);
 });
 
 /**
