@@ -181,16 +181,30 @@ if (!isset($query) || !$query instanceof WP_Query) {
 
 <?php
 // Map data: the properties matching the current search, across all pages.
-// This used to be a fresh unfiltered query, so the map kept showing the whole portfolio however
-// the visitor filtered. Reusing the listing's own query vars keeps the two in step; paging is
-// dropped because the map covers the entire result, not just the page on screen.
-$map_args = $query->query_vars;
-$map_args['posts_per_page'] = -1;
-$map_args['paged']          = 1;
-$map_args['offset']         = 0;
-$map_args['fields']         = '';
-$map_args['no_found_rows']  = true;
-$map_query = new WP_Query($map_args);
+//
+// Take only the listing query's meta_query rather than cloning its query_vars. A query that has
+// already run carries nopaging => false, and WP_Query only derives nopaging from posts_per_page
+// when the var is absent — so a cloned set combined with posts_per_page => -1 builds
+// "LIMIT 0, -1", which MySQL rejects, and the map silently comes back empty.
+//
+// With no filters applied the meta_query is just the Enabled clause, so the map shows every
+// property exactly as it always did; the city, guest and availability clauses narrow it only once
+// the visitor searches.
+$map_meta = $query->get('meta_query');
+if (empty($map_meta)) {
+    $map_meta = [[ 'key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=' ]];
+}
+
+$map_query = new WP_Query([
+    'post_type'      => 'rental_property',
+    'post_status'    => 'publish',
+    'posts_per_page' => -1,
+    'nopaging'       => true,
+    'no_found_rows'  => true,
+    'orderby'        => 'title',
+    'order'          => 'ASC',
+    'meta_query'     => $map_meta,
+]);
 $map_props = [];
 while ($map_query->have_posts()) { $map_query->the_post();
     $mid  = get_the_ID();
