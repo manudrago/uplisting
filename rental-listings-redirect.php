@@ -955,11 +955,26 @@ add_action('admin_init', function () {
         }
     }
 
+    // The direct booking site is fundamentally a search over availability, so the unfiltered
+    // /availability endpoint may already return exactly the listed set — a far simpler answer
+    // than any attribute. One call per account, so it is cheap enough to always measure.
+    $availability_ids = array();
+    foreach ($keys as $key) {
+        $client = new Uplisting_Client(array($key));
+        $resp = $client->get_availability();
+        foreach (($resp['data'] ?? array()) as $prop) {
+            if (!empty($prop['id'])) $availability_ids[] = (string) $prop['id'];
+        }
+    }
+    $availability_ids = array_values(array_unique($availability_ids));
+
     // How many properties each candidate rule would show, so the one matching the direct booking
     // sites can be picked on evidence instead of guessed.
-    $counts = array('status_only' => 0, 'status_and_site' => 0);
+    $counts = array('status_only' => 0, 'status_and_site' => 0, 'availability_endpoint' => count($availability_ids));
     if ($with_cal) { $counts['status_site_availability'] = 0; $counts['calendar_unreadable'] = 0; }
-    foreach ($rows as $row) {
+    $availability_lookup = array_flip($availability_ids);
+    foreach ($rows as $i => $row) {
+        $rows[$i]['in_availability_endpoint'] = isset($availability_lookup[$row['id']]);
         if (!empty($row['rule_status_only'])) $counts['status_only']++;
         if (!empty($row['rule_status_site'])) $counts['status_and_site']++;
         if ($with_cal) {
@@ -974,6 +989,7 @@ add_action('admin_init', function () {
         'active_rule'               => Uplisting_Sync::publish_rule(),
         'availability_months'       => $months,
         'counts_by_rule'            => $counts,
+        'availability_endpoint_ids' => $availability_ids,
         'live_by_current_rule'      => count(array_unique($live_ids)),
         'shown_on_site_now'         => count($shown),
         'shown_but_absent_from_api' => $orphans,
