@@ -936,6 +936,11 @@ add_action('admin_init', function () {
             $row['wp_status']  = $row['wp_post_id'] ? get_post_status($row['wp_post_id']) : null;
             $row['wp_rental_status'] = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_status', true) : null;
 
+            // The "from" price is what the direct booking site prints on each card, so it is the
+            // handle for matching a card that renders without its title.
+            $row['from_price'] = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_from_price', true) : null;
+            $row['city']       = $row['wp_post_id'] ? get_post_meta($row['wp_post_id'], '_rental_city', true) : null;
+
             $rows[] = $row;
         }
     }

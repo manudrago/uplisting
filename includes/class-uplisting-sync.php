@@ -222,6 +222,10 @@ class Uplisting_Sync {
                 'rule_status_site' => self::is_enabled($status) && '' !== trim($domain) && '' !== trim($slug),
             );
 
+            // Multi-unit properties render differently on the direct booking site, so count them.
+            $row['multi_units'] = count($property['relationships']['multi_units']['data'] ?? array());
+            $row['has_address'] = !empty($property['relationships']['address']['data']['id']);
+
             if ($with_availability) {
                 $window = $this->availability_window($id, $months);
                 $row['calendar_readable'] = (null !== $window);
