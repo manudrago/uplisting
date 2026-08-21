@@ -180,15 +180,17 @@ if (!isset($query) || !$query instanceof WP_Query) {
 </div>
 
 <?php
-// Map data: ALL enabled properties (not just the current page)
-$map_query = new WP_Query([
-    'post_type'      => 'rental_property',
-    'post_status'    => 'publish',
-    'posts_per_page' => -1,
-    'orderby'        => 'title',
-    'order'          => 'ASC',
-    'meta_query'     => [[ 'key' => '_rental_status', 'value' => 'Enabled', 'compare' => '=' ]],
-]);
+// Map data: the properties matching the current search, across all pages.
+// This used to be a fresh unfiltered query, so the map kept showing the whole portfolio however
+// the visitor filtered. Reusing the listing's own query vars keeps the two in step; paging is
+// dropped because the map covers the entire result, not just the page on screen.
+$map_args = $query->query_vars;
+$map_args['posts_per_page'] = -1;
+$map_args['paged']          = 1;
+$map_args['offset']         = 0;
+$map_args['fields']         = '';
+$map_args['no_found_rows']  = true;
+$map_query = new WP_Query($map_args);
 $map_props = [];
 while ($map_query->have_posts()) { $map_query->the_post();
     $mid  = get_the_ID();
@@ -210,4 +212,7 @@ while ($map_query->have_posts()) { $map_query->the_post();
 }
 wp_reset_postdata();
 ?>
+<?php // A data attribute rather than a script tag: this markup is also returned over AJAX, and
+      // jQuery strips script elements out of a parsed response. ?>
+<div id="rental-map-data" data-props="<?php echo esc_attr(wp_json_encode($map_props)); ?>" style="display:none"></div>
 <script>window.rentalAllProperties = <?php echo wp_json_encode($map_props); ?>;</script>

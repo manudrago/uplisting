@@ -157,6 +157,10 @@ jQuery(function ($) {
                     
                     grid.css('opacity', 1).show();
 
+                    // Redraw the map from the same filtered result the grid was built from,
+                    // otherwise every pin stays on screen whatever the visitor searched for.
+                    rebuildMap(readMapProps(parsed));
+
                     let paginationContainer = $('.rental-pagination');
                     if (!paginationContainer.length) {
                         $('#rental-results .rental-grid').after('<div class="rental-pagination"></div>');
@@ -233,8 +237,20 @@ jQuery(function ($) {
         });
     }
 
-    // --- Leaflet map: shows ALL properties (window.rentalAllProperties), with image popups ---
-    function rebuildMap() {
+    // Map points for a given document or parsed AJAX response. Falls back to the bootstrap value
+    // printed on first load.
+    function readMapProps($scope) {
+        try {
+            const raw = $scope && $scope.find ? $scope.find('#rental-map-data').attr('data-props') : null;
+            if (raw) return JSON.parse(raw);
+        } catch (e) {
+            console.error('Could not read map data', e);
+        }
+        return window.rentalAllProperties || [];
+    }
+
+    // --- Leaflet map: shows the properties matching the current search, with image popups ---
+    function rebuildMap(propsOverride) {
         if (typeof L === 'undefined' || !$('#rental-map').length) return;
 
         if (window.rentalMap) {
@@ -248,7 +264,7 @@ jQuery(function ($) {
             attribution: '&copy; OpenStreetMap contributors'
         }).addTo(map);
 
-        const props = window.rentalAllProperties || [];
+        const props = propsOverride || window.rentalAllProperties || [];
         const markers = [];
         const markersById = {};
         let markerIndex = 1;
@@ -320,6 +336,6 @@ jQuery(function ($) {
     }
 
     // Build the map on initial page load
-    rebuildMap();
+    rebuildMap(readMapProps($(document)));
 
 });
